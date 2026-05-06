@@ -45,9 +45,15 @@ class IndexDB:
                     source_path TEXT,
                     raw_meta TEXT,
                     pinned INTEGER DEFAULT 0,
-                    pinned_at REAL
+                    pinned_at REAL,
+                    hidden_indices TEXT
                 )
             """)
+            # 兼容旧表：添加 hidden_indices 字段
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN hidden_indices TEXT")
+            except sqlite3.OperationalError:
+                pass  # 字段已存在
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS scan_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,3 +142,18 @@ class IndexDB:
                 FROM sessions GROUP BY provider_id
             """).fetchall()
             return [dict(r) for r in rows]
+
+    def get_hidden_indices(self, session_id: str) -> List[int]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT hidden_indices FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row and row[0]:
+                try:
+                    return json.loads(row[0])
+                except Exception:
+                    return []
+            return []
+
+    def set_hidden_indices(self, session_id: str, indices: List[int]):
+        with self._conn() as conn:
+            conn.execute("UPDATE sessions SET hidden_indices = ? WHERE id = ?",
+                         (json.dumps(indices), session_id))

@@ -329,6 +329,34 @@ async function changeStatus(id, newStatus) {
   }
 }
 
+async function hideMessage(sessionId, idx) {
+  try {
+    await api(`/sessions/${sessionId}/hide-messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ indices: [idx] })
+    });
+    toast("已隐藏消息");
+    await openDetail(sessionId);
+  } catch (e) {
+    toast("隐藏失败: " + e.message, "error");
+  }
+}
+
+async function showMessage(sessionId, idx) {
+  try {
+    await api(`/sessions/${sessionId}/show-messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ indices: [idx] })
+    });
+    toast("已恢复显示");
+    await openDetail(sessionId);
+  } catch (e) {
+    toast("恢复失败: " + e.message, "error");
+  }
+}
+
 async function launchSession(id) {
   try {
     const res = await api(`/sessions/${id}/launch`, { method: "POST" });
@@ -418,8 +446,10 @@ async function openDetail(id) {
     const transcript = await api(`/sessions/${id}/transcript`);
     const dateStr = s.last_active_at ? fmtDate(s.last_active_at) : "未知";
     const createdStr = s.created_at ? fmtDate(s.created_at) : "未知";
+    const hiddenIndices = transcript.hidden_indices || [];
 
     const showFull = window._showFullContent || false;
+    const showHidden = window._showHiddenContent || false;
     const filteredMsgs = showFull
       ? transcript.messages
       : transcript.messages.filter(m => {
@@ -428,6 +458,7 @@ async function openDetail(id) {
         });
 
     let messagesHtml = filteredMsgs.map(m => {
+      const isHidden = hiddenIndices.includes(m.idx);
       const cls = `message-${m.role}`;
       const ts = (() => {
         if (!m.ts) return "";
@@ -439,11 +470,24 @@ async function openDetail(id) {
         }
         return isNaN(d.getTime()) ? "" : d.toLocaleTimeString("zh-CN");
       })();
+      if (isHidden && !showHidden) {
+        return `
+          <div class="bg-slate-800/50 border border-slate-700 rounded-lg p-2 mb-3 cursor-pointer hover:bg-slate-800" onclick="window._showHiddenContent=true; openDetail('${id}')">
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-slate-500">${m.role} — 已隐藏 (${(m.content||'').length} 字)</span>
+              <span class="text-xs text-slate-500">点击展开</span>
+            </div>
+          </div>
+        `;
+      }
       return `
-        <div class="${cls} rounded-lg p-3 mb-3">
+        <div class="${cls} rounded-lg p-3 mb-3 relative group">
           <div class="flex items-center justify-between mb-1">
             <span class="text-xs font-bold uppercase tracking-wide text-slate-300">${m.role}</span>
-            ${ts ? `<span class="text-xs text-slate-500">${ts}</span>` : ""}
+            <div class="flex items-center gap-2">
+              ${ts ? `<span class="text-xs text-slate-500">${ts}</span>` : ""}
+              <button onclick="hideMessage('${id}', ${m.idx})" class="text-xs px-2 py-0.5 bg-slate-700 hover:bg-red-600 rounded text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity" title="隐藏此条">隐藏</button>
+            </div>
           </div>
           <pre class="text-sm text-slate-200 whitespace-pre-wrap font-sans">${escapeHtml(m.content)}</pre>
         </div>
@@ -491,9 +535,14 @@ async function openDetail(id) {
       </div>
       <div class="mb-4 flex items-center justify-between">
         <span class="text-xs text-slate-400">对话内容</span>
-        <button onclick="toggleFullContent('${s.id}')" class="text-xs px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-slate-300">
-          ${showFull ? '切换简洁模式' : '切换完整模式'}
-        </button>
+        <div class="flex gap-2">
+          <button onclick="window._showHiddenContent=${!showHidden}; openDetail('${s.id}')" class="text-xs px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-slate-300">
+            ${showHidden ? '隐藏已折叠' : '显示已隐藏'}
+          </button>
+          <button onclick="toggleFullContent('${s.id}')" class="text-xs px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-slate-300">
+            ${showFull ? '切换简洁模式' : '切换完整模式'}
+          </button>
+        </div>
       </div>
       <hr class="border-slate-700 my-4">
       <div>${messagesHtml}</div>

@@ -187,20 +187,23 @@ def launch_session(session_id: str):
     project_dir = row.get("project_dir") or adapter.get_project_dir(row["session_id"])
 
     # 构建 PowerShell 命令
-    # 先设置 UTF-8 编码避免中文乱码/崩溃，再 cd 到项目目录，最后执行 resume 命令
-    ps_cmd = cmd
+    # 先设置 UTF-8 编码避免中文乱码/崩溃，再执行 resume 命令
+    # 使用 subprocess.Popen 的 cwd 参数设置工作目录，避免路径中的特殊字符（如 [] " ' 空格等）
+    # 在命令字符串中被 PowerShell 通配符或引号解析机制误处理
+    ps_cmd = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}'
+
+    popen_kwargs = {}
     if project_dir and Path(project_dir).exists():
-        ps_cmd = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; cd "{project_dir}"; {cmd}'
-    else:
-        ps_cmd = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}'
+        popen_kwargs["cwd"] = str(Path(project_dir).resolve())
 
     try:
         # 在新 PowerShell 窗口中执行
         subprocess.Popen(
             ["powershell", "-NoExit", "-Command", ps_cmd],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
+            **popen_kwargs,
         )
-        return {"launched": True, "command": ps_cmd}
+        return {"launched": True, "command": ps_cmd, "cwd": popen_kwargs.get("cwd")}
     except Exception as e:
         return JSONResponse(
             status_code=500,

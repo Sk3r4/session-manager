@@ -154,12 +154,10 @@ def get_transcript(session_id: str):
         return JSONResponse(status_code=404, content={"error": "Provider config not found"})
     adapter = build_adapter(cfg)
     messages = adapter.load_transcript(row["session_id"])
-    hidden = db.get_hidden_indices(session_id)
     return {
         "session_id": session_id,
         "provider_id": row["provider_id"],
-        "hidden_indices": hidden,
-        "messages": [{"idx": i, "role": m.role, "content": m.content, "ts": m.ts} for i, m in enumerate(messages)]
+        "messages": [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages]
     }
 
 @app.get("/api/sessions/{session_id}/copy-command")
@@ -189,19 +187,14 @@ def launch_session(session_id: str):
     project_dir = row.get("project_dir") or adapter.get_project_dir(row["session_id"])
 
     # 构建 PowerShell 命令
-    # 先设置 UTF-8 编码避免中文乱码/崩溃，再 cd 到项目目录，最后执行 resume 命令
-    # 注意：subprocess.Popen 的 cwd 参数会被 PowerShell -Command 启动时覆盖（它会自动 cd 到自己的安装目录）
-    # 所以必须在命令字符串内部使用 Set-Location -LiteralPath 来切换目录
-    # -LiteralPath 参数不解析通配符，可安全处理含 [] 等特殊字符的路径
+    # 先设置 UTF-8 编码避免中文乱码/崩溃，再执行 resume 命令
+    # 使用 subprocess.Popen 的 cwd 参数设置工作目录，避免路径中的特殊字符（如 [] " ' 空格等）
+    # 在命令字符串中被 PowerShell 通配符或引号解析机制误处理
     ps_cmd = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}'
 
     popen_kwargs = {}
     if project_dir and Path(project_dir).exists():
-        # 在命令字符串最前面插入 Set-Location，确保 PowerShell 内部目录正确
-        safe_dir = str(Path(project_dir).resolve())
-        ps_cmd = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Set-Location -LiteralPath "{safe_dir}"; {cmd}'
-        # cwd 作为保险，虽然 PowerShell 会覆盖，但保留无坏处
-        popen_kwargs["cwd"] = safe_dir
+        popen_kwargs["cwd"] = str(Path(project_dir).resolve())
 
     try:
         # 在新 PowerShell 窗口中执行
@@ -229,17 +222,15 @@ def export_session(session_id: str, format: str = Query("md")):
             return JSONResponse(status_code=404, content={"error": "Provider config not found"})
         adapter = build_adapter(cfg)
         messages = adapter.load_transcript(row["session_id"])
-        hidden = db.get_hidden_indices(session_id)
-        visible_messages = [m for i, m in enumerate(messages) if i not in hidden]
 
         safe_name = _safe_filename(row.get("title") or row["session_id"])
 
         if format == "pdf":
-            data = export_pdf(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in visible_messages])
+            data = export_pdf(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
             filename = f"{safe_name}.pdf"
             media_type = "application/pdf"
         else:
-            text = export_markdown(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in visible_messages])
+            text = export_markdown(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
             data = text.encode("utf-8")
             filename = f"{safe_name}.md"
             media_type = "text/markdown; charset=utf-8"
@@ -258,30 +249,6 @@ def export_session(session_id: str, format: str = Query("md")):
 @app.get("/api/status-options")
 def status_options():
     return STATUS_OPTIONS
-
-
-class HideMessagesReq(BaseModel):
-    indices: List[int]
-
-@app.post("/api/sessions/{session_id}/hide-messages")
-def hide_messages(session_id: str, req: HideMessagesReq):
-    row = db.get_session(session_id)
-    if not row:
-        return JSONResponse(status_code=404, content={"error": "Session not found"})
-    current = db.get_hidden_indices(session_id)
-    new_hidden = sorted(list(set(current + req.indices)))
-    db.set_hidden_indices(session_id, new_hidden)
-    return {"hidden_indices": new_hidden}
-
-@app.post("/api/sessions/{session_id}/show-messages")
-def show_messages(session_id: str, req: HideMessagesReq):
-    row = db.get_session(session_id)
-    if not row:
-        return JSONResponse(status_code=404, content={"error": "Session not found"})
-    current = db.get_hidden_indices(session_id)
-    new_hidden = sorted([i for i in current if i not in req.indices])
-    db.set_hidden_indices(session_id, new_hidden)
-    return {"hidden_indices": new_hidden}
 
 @app.post("/api/sessions/{session_id}/pin")
 def pin_session(session_id: str):

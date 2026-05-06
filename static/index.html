@@ -1,0 +1,543 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Manager - CLI 会话管理器</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; }
+  .tag { display:inline-flex; align-items:center; padding: 0.15rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+  .tag-未标注 { background:#334155; color:#94a3b8; }
+  .tag-进行中 { background:#1e3a8a; color:#93c5fd; }
+  .tag-已完成 { background:#064e3b; color:#6ee7b7; }
+  .tag-待跟进 { background:#713f12; color:#fcd34d; }
+  .tag-已归档 { background:#3f3f46; color:#a1a1aa; }
+  .message-user { background: #1e3a8a; border-left: 4px solid #3b82f6; }
+  .message-assistant { background: #064e3b; border-left: 4px solid #22c55e; }
+  .message-tool { background: #713f12; border-left: 4px solid #eab308; }
+  .message-system { background: #3f3f46; border-left: 4px solid #71717a; }
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: #0f172a; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  .fade-in { animation: fadeIn 0.2s ease-in; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(4px);} to { opacity:1; transform: translateY(0);} }
+</style>
+</head>
+<body class="min-h-screen">
+<div id="app" class="max-w-6xl mx-auto p-4 md:p-6">
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold text-white">Session Manager</h1>
+      <p class="text-slate-400 text-sm mt-1">统一管理 Codex / Claude Code / Kimi Code 本地会话</p>
+    </div>
+    <button onclick="scanAll()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition">
+      扫描全部
+    </button>
+  </div>
+
+  <!-- Stats -->
+  <div id="stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></div>
+
+  <!-- Filters -->
+  <div class="card p-4 mb-6 flex flex-col md:flex-row gap-3 items-stretch md:items-center">
+    <input id="searchInput" type="text" placeholder="搜索会话..." oninput="renderList()"
+           class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+    <select id="providerFilter" onchange="renderList()" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+      <option value="">全部 Provider</option>
+    </select>
+    <select id="statusFilter" onchange="renderList()" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+      <option value="">全部状态</option>
+    </select>
+    <div class="flex bg-slate-900 border border-slate-700 rounded-lg overflow-hidden">
+      <button onclick="setView('timeline')" id="btnTimeline" class="px-3 py-2 text-sm text-white bg-blue-600">时间线</button>
+      <button onclick="setView('project')" id="btnProject" class="px-3 py-2 text-sm text-slate-400 hover:text-white">项目</button>
+    </div>
+  </div>
+
+  <!-- Session List -->
+  <div id="sessionList" class="space-y-3"></div>
+
+  <!-- Empty State -->
+  <div id="emptyState" class="hidden text-center py-16">
+    <div class="text-4xl mb-3">📂</div>
+    <p class="text-slate-400">暂无会话数据，请点击右上角「扫描全部」开始。</p>
+  </div>
+</div>
+
+<!-- Detail Modal -->
+<div id="detailModal" class="fixed inset-0 bg-black/70 hidden z-50 flex justify-end">
+  <div class="w-full md:w-2/3 lg:w-1/2 bg-slate-900 h-full overflow-y-auto border-l border-slate-700 p-5 fade-in">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-white">会话详情</h2>
+      <button onclick="closeModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+    </div>
+    <div id="detailContent"></div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-6 right-6 bg-slate-800 text-white px-4 py-3 rounded-lg shadow-lg border border-slate-700 hidden transition-opacity opacity-0 z-50"></div>
+
+<script>
+let sessions = [];
+let statusOptions = [];
+let providers = [];
+let currentView = "timeline"; // 'timeline' | 'project'
+
+async function api(path, opts = {}) {
+  const res = await fetch(`/api${path}`, opts);
+  if (!res.ok) throw new Error((await res.json()).error || "请求失败");
+  return res.json();
+}
+
+function toast(msg, type = "info") {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.remove("hidden", "opacity-0");
+  setTimeout(() => { el.classList.add("opacity-0"); setTimeout(() => el.classList.add("hidden"), 300); }, 2500);
+}
+
+async function init() {
+  providers = await api("/providers");
+  statusOptions = await api("/status-options");
+  renderProviderFilter();
+  renderStatusFilter();
+  await loadStats();
+  await loadSessions();
+}
+
+function renderProviderFilter() {
+  const sel = document.getElementById("providerFilter");
+  sel.innerHTML = `<option value="">全部 Provider</option>` +
+    providers.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
+}
+
+function renderStatusFilter() {
+  const sel = document.getElementById("statusFilter");
+  sel.innerHTML = `<option value="">全部状态</option>` +
+    statusOptions.map(s => `<option value="${s}">${s}</option>`).join("");
+}
+
+async function loadStats() {
+  const stats = await api("/stats");
+  const container = document.getElementById("stats");
+  container.innerHTML = stats.map(s => `
+    <div class="card p-3">
+      <div class="text-xs text-slate-400">${s.provider_id}</div>
+      <div class="text-xl font-bold text-white mt-1">${s.total}</div>
+      <div class="text-xs text-slate-500 mt-1">已标注 ${s.labeled || 0}</div>
+    </div>
+  `).join("");
+}
+
+async function loadSessions() {
+  sessions = await api("/sessions");
+  renderList();
+}
+
+function setView(view) {
+  currentView = view;
+  document.getElementById("btnTimeline").className = view === "timeline"
+    ? "px-3 py-2 text-sm text-white bg-blue-600"
+    : "px-3 py-2 text-sm text-slate-400 hover:text-white";
+  document.getElementById("btnProject").className = view === "project"
+    ? "px-3 py-2 text-sm text-white bg-blue-600"
+    : "px-3 py-2 text-sm text-slate-400 hover:text-white";
+  renderList();
+}
+
+function renderList() {
+  if (currentView === "project") {
+    renderProjectView();
+  } else {
+    renderTimelineView();
+  }
+}
+
+function getFilteredSessions() {
+  const search = document.getElementById("searchInput").value.toLowerCase();
+  const provider = document.getElementById("providerFilter").value;
+  const status = document.getElementById("statusFilter").value;
+  return sessions.filter(s => {
+    if (provider && s.provider_id !== provider) return false;
+    if (status && s.status !== status) return false;
+    if (search) {
+      const text = (s.display_name + " " + (s.summary||"") + " " + (s.project_dir||"")).toLowerCase();
+      if (!text.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function renderTimelineView() {
+  const filtered = getFilteredSessions();
+  const container = document.getElementById("sessionList");
+  const empty = document.getElementById("emptyState");
+
+  if (filtered.length === 0) {
+    container.innerHTML = "";
+    empty.classList.remove("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+
+  container.innerHTML = filtered.map(s => sessionCard(s)).join("");
+}
+
+function renderProjectView() {
+  const filtered = getFilteredSessions();
+  const container = document.getElementById("sessionList");
+  const empty = document.getElementById("emptyState");
+
+  if (filtered.length === 0) {
+    container.innerHTML = "";
+    empty.classList.remove("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+
+  // 按 project_dir 分组
+  const groups = {};
+  for (const s of filtered) {
+    const dir = s.project_dir || "未归类";
+    if (!groups[dir]) groups[dir] = [];
+    groups[dir].push(s);
+  }
+
+  // 排序：有目录的按字母序，未归类放最后
+  const dirs = Object.keys(groups).sort((a, b) => {
+    if (a === "未归类") return 1;
+    if (b === "未归类") return -1;
+    return a.localeCompare(b);
+  });
+
+  container.innerHTML = dirs.map(dir => {
+    const items = groups[dir];
+    const counts = {};
+    for (const s of items) {
+      counts[s.provider_id] = (counts[s.provider_id] || 0) + 1;
+    }
+    const countBadge = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(" | ");
+    const groupId = "proj-" + btoa(unescape(encodeURIComponent(dir))).replace(/[^a-zA-Z0-9]/g, "");
+    return `
+    <div class="card mb-4 overflow-hidden">
+      <div class="p-4 bg-slate-800/50 cursor-pointer hover:bg-slate-800 transition flex items-center justify-between" onclick="toggleGroup('${groupId}')">
+        <div class="flex items-center gap-3">
+          <span id="icon-${groupId}" class="text-slate-400">▼</span>
+          <div>
+            <div class="font-medium text-white">${escapeHtml(dir)}</div>
+            <div class="text-xs text-slate-400 mt-1">${items.length} 个会话 | ${countBadge}</div>
+          </div>
+        </div>
+      </div>
+      <div id="${groupId}" class="p-3 space-y-2">
+        ${items.map(s => sessionCard(s)).join("")}
+      </div>
+    </div>
+    `;
+  }).join("");
+}
+
+function toggleGroup(id) {
+  const el = document.getElementById(id);
+  const icon = document.getElementById("icon-" + id);
+  if (el.classList.contains("hidden")) {
+    el.classList.remove("hidden");
+    icon.textContent = "▼";
+  } else {
+    el.classList.add("hidden");
+    icon.textContent = "▶";
+  }
+}
+
+function sessionCard(s) {
+  const dateStr = s.last_active_at ? fmtDate(s.last_active_at) : "未知";
+  const dirStr = s.project_dir ? `<span class="text-xs text-slate-500 ml-2">📁 ${s.project_dir}</span>` : "";
+  const pinIcon = s.pinned ? "⭐" : "☆";
+  const pinClass = s.pinned ? "text-yellow-400" : "text-slate-600 hover:text-yellow-400";
+  return `
+  <div class="card p-4 hover:border-slate-500 transition cursor-pointer fade-in ${s.pinned ? 'border-yellow-600/50' : ''}" onclick="openDetail('${s.id}')">
+    <div class="flex items-start justify-between">
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs font-semibold text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded">${s.provider_id}</span>
+          <span class="tag tag-${s.status}">${s.status}</span>
+          ${s.pinned ? '<span class="text-xs">⭐ 已置顶</span>' : ''}
+          ${currentView === 'timeline' ? dirStr : ''}
+        </div>
+        <div class="mt-1 font-medium text-white truncate">${escapeHtml(s.display_name)}</div>
+        ${s.summary ? `<div class="text-sm text-slate-400 mt-1 line-clamp-1">${escapeHtml(s.summary)}</div>` : ""}
+        <div class="text-xs text-slate-500 mt-2">${dateStr}</div>
+      </div>
+      <div class="ml-4 flex flex-col gap-2">
+        <button onclick="event.stopPropagation(); togglePin('${s.id}', ${s.pinned ? 1 : 0})" class="text-lg leading-none ${pinClass}" title="${s.pinned ? '取消置顶' : '置顶'}">${pinIcon}</button>
+        <button onclick="event.stopPropagation(); renameSession('${s.id}', '${escapeHtml(s.display_name)}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">重命名</button>
+        <button onclick="event.stopPropagation(); changeStatus('${s.id}', '${s.status}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">改状态</button>
+        <button onclick="event.stopPropagation(); copyCommand('${s.id}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">复制命令</button>
+      </div>
+    </div>
+  </div>
+  `;
+}
+
+async function scanAll() {
+  toast("开始扫描...");
+  try {
+    const res = await api("/scan-all", { method: "POST" });
+    const total = res.reduce((a, b) => a + (b.found || 0), 0);
+    toast(`扫描完成，共发现 ${total} 个会话`);
+    await loadStats();
+    await loadSessions();
+  } catch (e) {
+    toast("扫描失败: " + e.message, "error");
+  }
+}
+
+async function renameSession(id, current) {
+  const name = prompt("输入新名称（留空恢复默认）:", current);
+  if (name === null) return;
+  try {
+    await api(`/sessions/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: name || null })
+    });
+    toast("重命名成功");
+    await loadSessions();
+  } catch (e) {
+    toast("重命名失败: " + e.message, "error");
+  }
+}
+
+async function changeStatus(id, current) {
+  const opts = statusOptions.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  const choice = prompt(`选择新状态:\n${opts}`, current);
+  if (!choice) return;
+  const idx = parseInt(choice) - 1;
+  const newStatus = statusOptions[idx] || choice;
+  try {
+    await api(`/sessions/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: newStatus })
+    });
+    toast("状态更新成功");
+    await loadSessions();
+  } catch (e) {
+    toast("状态更新失败: " + e.message, "error");
+  }
+}
+
+async function launchSession(id) {
+  try {
+    const res = await api(`/sessions/${id}/launch`, { method: "POST" });
+    toast("已在新 PowerShell 窗口中恢复会话");
+  } catch (e) {
+    toast("启动失败，已降级为复制命令", "error");
+    copyCommand(id);
+  }
+}
+
+async function togglePin(id, isPinned) {
+  try {
+    const action = isPinned ? 'unpin' : 'pin';
+    await api(`/sessions/${id}/${action}`, { method: "POST" });
+    toast(isPinned ? "已取消置顶" : "已置顶");
+    await loadSessions();
+  } catch (e) {
+    toast("操作失败: " + e.message, "error");
+  }
+}
+
+async function copyCommand(id) {
+  try {
+    const res = await api(`/sessions/${id}/copy-command`);
+    const cmd = res.command;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(cmd);
+      toast(`已复制: ${cmd}`);
+    } else {
+      // 降级方案：使用 textarea + execCommand
+      const ta = document.createElement("textarea");
+      ta.value = cmd;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) {
+        toast(`已复制: ${cmd}`);
+      } else {
+        prompt("请手动复制以下命令:", cmd);
+      }
+    }
+  } catch (e) {
+    toast("复制失败: " + e.message, "error");
+  }
+}
+
+async function exportSession(id, format) {
+  try {
+    const res = await fetch(`/api/sessions/${id}/export?format=${format}`);
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || "导出失败");
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    // 从 Content-Disposition 解析文件名，或使用默认
+    const cd = res.headers.get("content-disposition");
+    let filename = `session_export.${format}`;
+    if (cd) {
+      const m = cd.match(/filename="?([^"]+)"?/);
+      if (m) filename = m[1];
+    }
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+    toast(`已导出: ${filename}`);
+  } catch (e) {
+    toast("导出失败: " + e.message, "error");
+  }
+}
+
+async function openDetail(id) {
+  const s = sessions.find(x => x.id === id);
+  if (!s) return;
+  document.getElementById("detailModal").classList.remove("hidden");
+  const content = document.getElementById("detailContent");
+  content.innerHTML = `<div class="text-slate-400">加载中...</div>`;
+
+  try {
+    const transcript = await api(`/sessions/${id}/transcript`);
+    const dateStr = s.last_active_at ? fmtDate(s.last_active_at) : "未知";
+    const createdStr = s.created_at ? fmtDate(s.created_at) : "未知";
+
+    const showFull = window._showFullContent || false;
+    const filteredMsgs = showFull
+      ? transcript.messages
+      : transcript.messages.filter(m => {
+          const role = m.role || "";
+          return (role === "user" || role === "assistant") && (m.content || "").trim().length > 0;
+        });
+
+    let messagesHtml = filteredMsgs.map(m => {
+      const cls = `message-${m.role}`;
+      const ts = (() => {
+        if (!m.ts) return "";
+        let d;
+        if (typeof m.ts === "number") {
+          d = m.ts > 1e12 ? new Date(m.ts) : new Date(m.ts * 1000);
+        } else {
+          d = new Date(m.ts);
+        }
+        return isNaN(d.getTime()) ? "" : d.toLocaleTimeString("zh-CN");
+      })();
+      return `
+        <div class="${cls} rounded-lg p-3 mb-3">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-bold uppercase tracking-wide text-slate-300">${m.role}</span>
+            ${ts ? `<span class="text-xs text-slate-500">${ts}</span>` : ""}
+          </div>
+          <pre class="text-sm text-slate-200 whitespace-pre-wrap font-sans">${escapeHtml(m.content)}</pre>
+        </div>
+      `;
+    }).join("");
+
+    if (!messagesHtml) messagesHtml = `<div class="text-slate-500">无法解析对话内容或内容为空。</div>`;
+
+    content.innerHTML = `
+      <div class="mb-4">
+        <div class="text-xs text-slate-400 mb-1">Provider</div>
+        <div class="text-white font-medium">${s.provider_id}</div>
+      </div>
+      <div class="mb-4">
+        <div class="text-xs text-slate-400 mb-1">Session ID</div>
+        <div class="text-white font-mono text-sm break-all">${s.session_id}</div>
+      </div>
+      <div class="mb-4">
+        <div class="text-xs text-slate-400 mb-1">状态</div>
+        <span class="tag tag-${s.status}">${s.status}</span>
+      </div>
+      <div class="mb-4">
+        <div class="text-xs text-slate-400 mb-1">时间</div>
+        <div class="text-sm text-slate-300">创建: ${createdStr} | 最后活跃: ${dateStr}</div>
+      </div>
+      ${s.project_dir ? `
+      <div class="mb-4">
+        <div class="text-xs text-slate-400 mb-1">项目目录</div>
+        <div class="text-sm text-slate-300 font-mono">${s.project_dir}</div>
+      </div>` : ""}
+      ${s.source_path ? `
+      <div class="mb-4">
+        <div class="text-xs text-slate-400 mb-1">源文件</div>
+        <div class="text-sm text-slate-500 font-mono break-all">${s.source_path}</div>
+      </div>` : ""}
+      <div class="mb-4 flex gap-2 flex-wrap">
+        <button onclick="launchSession('${s.id}')" class="px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded text-sm text-white">在 PowerShell 恢复</button>
+        <button onclick="copyCommand('${s.id}')" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm text-white">复制恢复命令</button>
+        <button onclick="exportSession('${s.id}', 'md')" class="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-sm text-white">导出 Markdown</button>
+        <button onclick="exportSession('${s.id}', 'pdf')" class="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 rounded text-sm text-white">导出 PDF</button>
+        <button onclick="renameSession('${s.id}', '${escapeHtml(s.display_name)}')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white">重命名</button>
+        <button onclick="changeStatus('${s.id}', '${s.status}')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white">改状态</button>
+      </div>
+      <div class="mb-4 flex items-center justify-between">
+        <span class="text-xs text-slate-400">对话内容</span>
+        <button onclick="toggleFullContent('${s.id}')" class="text-xs px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-slate-300">
+          ${showFull ? '切换简洁模式' : '切换完整模式'}
+        </button>
+      </div>
+      <hr class="border-slate-700 my-4">
+      <div>${messagesHtml}</div>
+    `;
+  } catch (e) {
+    content.innerHTML = `<div class="text-red-400">加载失败: ${e.message}</div>`;
+  }
+}
+
+function toggleFullContent(id) {
+  window._showFullContent = !window._showFullContent;
+  openDetail(id);
+}
+
+function closeModal() {
+  document.getElementById("detailModal").classList.add("hidden");
+}
+
+function fmtDate(ts) {
+  if (!ts) return "";
+  let d;
+  if (typeof ts === "number") {
+    d = ts > 1e12 ? new Date(ts) : new Date(ts * 1000);
+  } else {
+    d = new Date(ts);
+  }
+  return isNaN(d.getTime()) ? String(ts) : d.toLocaleString("zh-CN");
+}
+
+function escapeHtml(text) {
+  if (!text) return "";
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// 点击遮罩关闭
+window.onclick = function(event) {
+  const modal = document.getElementById("detailModal");
+  if (event.target === modal) closeModal();
+};
+
+init();
+</script>
+</body>
+</html>
+

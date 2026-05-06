@@ -279,6 +279,7 @@ function sessionCard(s) {
           ${statusOptions.map(opt => `<option value="${opt}" ${opt === s.status ? 'selected' : ''}>${opt}</option>`).join('')}
         </select>
         <button onclick="event.stopPropagation(); copyCommand('${s.id}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">复制命令</button>
+        <button onclick="event.stopPropagation(); deleteSession('${s.id}')" class="text-xs px-2 py-1 bg-red-900/50 hover:bg-red-700 rounded text-red-200" title="从列表中删除">删除</button>
       </div>
     </div>
   </div>
@@ -326,6 +327,18 @@ async function changeStatus(id, newStatus) {
     await loadSessions();
   } catch (e) {
     toast("状态更新失败: " + e.message, "error");
+  }
+}
+
+async function deleteSession(id) {
+  if (!confirm("确定要从列表中删除此会话吗？原始数据文件不会被删除。")) return;
+  try {
+    await api(`/sessions/${id}`, { method: "DELETE" });
+    toast("会话已删除");
+    await loadSessions();
+    await loadStats();
+  } catch (e) {
+    toast("删除失败: " + e.message, "error");
   }
 }
 

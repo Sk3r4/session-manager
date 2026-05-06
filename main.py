@@ -246,6 +246,14 @@ def export_session(session_id: str, format: str = Query("md")):
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str):
+    row = db.get_session(session_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    db.delete_session(session_id)
+    return {"deleted": True}
+
 @app.get("/api/status-options")
 def status_options():
     return STATUS_OPTIONS

@@ -45,9 +45,15 @@ class IndexDB:
                     source_path TEXT,
                     raw_meta TEXT,
                     pinned INTEGER DEFAULT 0,
-                    pinned_at REAL
+                    pinned_at REAL,
+                    deleted INTEGER DEFAULT 0
                 )
             """)
+            # 兼容旧表
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN deleted INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS scan_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +67,7 @@ class IndexDB:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON sessions(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_last_active ON sessions(last_active_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pinned ON sessions(pinned)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted ON sessions(deleted)")
 
     def upsert_sessions(self, records: List[SessionRecord]):
         with self._conn() as conn:
@@ -76,7 +83,8 @@ class IndexDB:
                         created_at=COALESCE(excluded.created_at, sessions.created_at),
                         last_active_at=COALESCE(excluded.last_active_at, sessions.last_active_at),
                         source_path=excluded.source_path,
-                        raw_meta=excluded.raw_meta
+                        raw_meta=excluded.raw_meta,
+                        deleted=COALESCE(sessions.deleted, 0)
                 """, (r.id, r.provider_id, r.session_id, r.title, r.summary, r.project_dir, r.status,
                       r.created_at, r.last_active_at, r.source_path, r.raw_meta))
 
@@ -98,7 +106,7 @@ class IndexDB:
             )
 
     def list_sessions(self, provider: Optional[str] = None, status: Optional[str] = None, search: Optional[str] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM sessions WHERE 1=1"
+        sql = "SELECT * FROM sessions WHERE deleted = 0"
         params = []
         if provider:
             sql += " AND provider_id = ?"
@@ -126,6 +134,11 @@ class IndexDB:
             conn.execute("INSERT INTO scan_log (provider_id, sessions_found, error) VALUES (?, ?, ?)",
                          (provider_id, sessions_found, error))
 
+    def delete_session(self, session_id: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute("UPDATE sessions SET deleted = 1 WHERE id = ?", (session_id,))
+            return cur.rowcount > 0
+
     def get_providers_summary(self) -> List[Dict[str, Any]]:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
@@ -133,6 +146,6 @@ class IndexDB:
                 SELECT provider_id, COUNT(*) as total,
                        SUM(CASE WHEN status != '未标注' THEN 1 ELSE 0 END) as labeled,
                        SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END) as pinned
-                FROM sessions GROUP BY provider_id
+                FROM sessions WHERE deleted = 0 GROUP BY provider_id
             """).fetchall()
             return [dict(r) for r in rows]

@@ -275,7 +275,9 @@ function sessionCard(s) {
       <div class="ml-4 flex flex-col gap-2">
         <button onclick="event.stopPropagation(); togglePin('${s.id}', ${s.pinned ? 1 : 0})" class="text-lg leading-none ${pinClass}" title="${s.pinned ? '取消置顶' : '置顶'}">${pinIcon}</button>
         <button onclick="event.stopPropagation(); renameSession('${s.id}', '${escapeHtml(s.display_name)}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">重命名</button>
-        <button onclick="event.stopPropagation(); changeStatus('${s.id}', '${s.status}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">改状态</button>
+        <select onchange="event.stopPropagation(); changeStatus('${s.id}', this.value)" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white border-none cursor-pointer outline-none">
+          ${statusOptions.map(opt => `<option value="${opt}" ${opt === s.status ? 'selected' : ''}>${opt}</option>`).join('')}
+        </select>
         <button onclick="event.stopPropagation(); copyCommand('${s.id}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">复制命令</button>
       </div>
     </div>
@@ -312,12 +314,8 @@ async function renameSession(id, current) {
   }
 }
 
-async function changeStatus(id, current) {
-  const opts = statusOptions.map((s, i) => `${i + 1}. ${s}`).join("\n");
-  const choice = prompt(`选择新状态:\n${opts}`, current);
-  if (!choice) return;
-  const idx = parseInt(choice) - 1;
-  const newStatus = statusOptions[idx] || choice;
+async function changeStatus(id, newStatus) {
+  if (!newStatus) return;
   try {
     await api(`/sessions/${id}`, {
       method: "PUT",
@@ -487,7 +485,9 @@ async function openDetail(id) {
         <button onclick="exportSession('${s.id}', 'md')" class="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-sm text-white">导出 Markdown</button>
         <button onclick="exportSession('${s.id}', 'pdf')" class="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 rounded text-sm text-white">导出 PDF</button>
         <button onclick="renameSession('${s.id}', '${escapeHtml(s.display_name)}')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white">重命名</button>
-        <button onclick="changeStatus('${s.id}', '${s.status}')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white">改状态</button>
+        <select onchange="changeStatus('${s.id}', this.value)" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white border-none cursor-pointer outline-none">
+          ${statusOptions.map(opt => `<option value="${opt}" ${opt === s.status ? 'selected' : ''}>${opt}</option>`).join('')}
+        </select>
       </div>
       <div class="mb-4 flex items-center justify-between">
         <span class="text-xs text-slate-400">对话内容</span>

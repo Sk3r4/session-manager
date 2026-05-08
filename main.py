@@ -114,9 +114,23 @@ def scan_all():
 def list_sessions(
     provider: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    search: Optional[str] = Query(None)
+    search: Optional[str] = Query(None),
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    project_dir: Optional[str] = Query(None)
 ):
-    rows = db.list_sessions(provider=provider, status=status, search=search)
+    if from_ts is not None or to_ts is not None or project_dir is not None:
+        rows = db.list_sessions_by_date_range(from_ts=from_ts, to_ts=to_ts, project_dir=project_dir)
+        # 再应用 provider/status/search 过滤
+        if provider:
+            rows = [r for r in rows if r["provider_id"] == provider]
+        if status:
+            rows = [r for r in rows if r["status"] == status]
+        if search:
+            s = search.lower()
+            rows = [r for r in rows if s in (r.get("display_name") or r["session_id"]).lower() or s in (r.get("summary") or "").lower() or s in (r.get("project_dir") or "").lower()]
+    else:
+        rows = db.list_sessions(provider=provider, status=status, search=search)
     for r in rows:
         r["display_name"] = r["title"] or r["session_id"]
     return rows
@@ -273,6 +287,10 @@ def unpin_session(session_id: str):
     if not row:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
     return row
+
+@app.get("/api/daily-stats")
+def daily_stats():
+    return db.get_daily_stats()
 
 @app.get("/api/stats")
 def stats():

@@ -311,58 +311,158 @@ function filterByDate(day) {
   renderList();
 }
 
-function renderProjectView() {
-  const filtered = getFilteredSessions();
+async function renderProjectView() {
   const container = document.getElementById("sessionList");
   const empty = document.getElementById("emptyState");
 
-  if (filtered.length === 0) {
+  // 加载项目列表
+  let projects = [];
+  try {
+    projects = await api("/projects");
+  } catch (e) {
+    console.error("加载项目失败", e);
+  }
+
+  // 应用搜索过滤
+  const search = document.getElementById("searchInput").value.toLowerCase();
+  if (search) {
+    projects = projects.filter(p => {
+      const text = (p.display_name + " " + p.path).toLowerCase();
+      return text.includes(search);
+    });
+  }
+
+  if (projects.length === 0) {
     container.innerHTML = "";
     empty.classList.remove("hidden");
+    empty.querySelector("p").textContent = "暂无项目数据，请先扫描会话。";
     return;
   }
   empty.classList.add("hidden");
 
-  // 按 project_dir 分组
-  const groups = {};
-  for (const s of filtered) {
-    const dir = s.project_dir || "未归类";
-    if (!groups[dir]) groups[dir] = [];
-    groups[dir].push(s);
-  }
-
-  // 排序：有目录的按字母序，未归类放最后
-  const dirs = Object.keys(groups).sort((a, b) => {
-    if (a === "未归类") return 1;
-    if (b === "未归类") return -1;
-    return a.localeCompare(b);
-  });
-
-  container.innerHTML = dirs.map(dir => {
-    const items = groups[dir];
-    const counts = {};
-    for (const s of items) {
-      counts[s.provider_id] = (counts[s.provider_id] || 0) + 1;
-    }
-    const countBadge = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(" | ");
-    const groupId = "proj-" + btoa(unescape(encodeURIComponent(dir))).replace(/[^a-zA-Z0-9]/g, "");
+  container.innerHTML = projects.map(p => {
+    const groupId = "proj-" + btoa(unescape(encodeURIComponent(p.id))).replace(/[^a-zA-Z0-9]/g, "");
+    const lastActive = p.last_active_at ? fmtDate(p.last_active_at) : "未知";
     return `
-    <div class="card mb-4 overflow-hidden">
-      <div class="p-4 bg-slate-800/50 cursor-pointer hover:bg-slate-800 transition flex items-center justify-between" onclick="toggleGroup('${groupId}')">
-        <div class="flex items-center gap-3">
-          <span id="icon-${groupId}" class="text-slate-400">▼</span>
-          <div>
-            <div class="font-medium text-white">${escapeHtml(dir)}</div>
-            <div class="text-xs text-slate-400 mt-1">${items.length} 个会话 | ${countBadge}</div>
+    <div class="card mb-4 overflow-hidden" id="card-${groupId}">
+      <div class="p-4 bg-slate-800/50 cursor-pointer hover:bg-slate-800 transition" onclick="toggleProjectGroup('${groupId}', '${encodeURIComponent(p.id)}')">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <span id="icon-${groupId}" class="text-slate-400 transition-transform">▼</span>
+            <div>
+              <div class="font-medium text-white">${escapeHtml(p.display_name || p.name || p.id)}</div>
+              <div class="text-xs text-slate-400 mt-1">${escapeHtml(p.path)}</div>
+              <div class="text-xs text-slate-500 mt-1">${p.session_count || 0} 个会话 · 最后活跃: ${lastActive}</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="tag" style="background:#1e3a8a;color:#93c5fd">${p.status || '活跃'}</span>
           </div>
         </div>
+        <div class="mt-3 flex gap-2 flex-wrap">
+          <button onclick="event.stopPropagation(); exportProject('${encodeURIComponent(p.id)}')" class="text-xs px-2 py-1 bg-purple-600 hover:bg-purple-500 rounded text-white">导出 ZIP</button>
+          <button onclick="event.stopPropagation(); renameProject('${encodeURIComponent(p.id)}', '${escapeHtml(p.display_name || p.name || p.id)}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">重命名</button>
+          <select onchange="event.stopPropagation(); changeProjectStatus('${encodeURIComponent(p.id)}', this.value)" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white border-none cursor-pointer outline-none">
+            <option value="">修改状态</option>
+            <option value="活跃">活跃</option>
+            <option value="归档">归档</option>
+            <option value="暂停">暂停</option>
+          </select>
+        </div>
       </div>
-      <div id="${groupId}" class="p-3 space-y-2">
-        ${items.map(s => sessionCard(s)).join("")}
+      <div id="${groupId}" class="hidden p-3 space-y-2 border-t border-slate-700/50">
+        <div class="text-xs text-slate-500 text-center py-4" id="loading-${groupId}">点击展开加载会话...</div>
       </div>
     </div>
     `;
   }).join("");
+}
+
+async function toggleProjectGroup(groupId, projectId) {
+  const el = document.getElementById(groupId);
+  const icon = document.getElementById("icon-" + groupId);
+  if (el.classList.contains("hidden")) {
+    el.classList.remove("hidden");
+    icon.textContent = "▼";
+    // 加载会话
+    const loading = document.getElementById("loading-" + groupId);
+    if (loading && loading.textContent === "点击展开加载会话...") {
+      loading.textContent = "加载中...";
+      try {
+        const items = await api("/projects/" + decodeURIComponent(projectId) + "/sessions");
+        if (items.length === 0) {
+          el.innerHTML = `<div class="text-xs text-slate-500 text-center py-4">该项目下无会话</div>`;
+        } else {
+          el.innerHTML = items.map(s => sessionCard(s)).join("");
+        }
+      } catch (e) {
+        el.innerHTML = `<div class="text-xs text-red-400 text-center py-4">加载失败: ${e.message}</div>`;
+      }
+    }
+  } else {
+    el.classList.add("hidden");
+    icon.textContent = "▶";
+  }
+}
+
+async function exportProject(projectId) {
+  try {
+    const res = await fetch("/api/projects/" + decodeURIComponent(projectId) + "/export", { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || "导出失败");
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const cd = res.headers.get("content-disposition");
+    let filename = "project_sessions.zip";
+    if (cd) {
+      const m = cd.match(/filename="?([^"]+)"?/);
+      if (m) filename = m[1];
+    }
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+    toast(`已导出: ${filename}`);
+  } catch (e) {
+    toast("导出失败: " + e.message, "error");
+  }
+}
+
+async function renameProject(projectId, current) {
+  const name = prompt("输入显示名称（留空恢复默认）:", current);
+  if (name === null) return;
+  try {
+    await api("/projects/" + decodeURIComponent(projectId), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: name || null })
+    });
+    toast("重命名成功");
+    await loadSessions();
+    renderList();
+  } catch (e) {
+    toast("重命名失败: " + e.message, "error");
+  }
+}
+
+async function changeProjectStatus(projectId, status) {
+  if (!status) return;
+  try {
+    await api("/projects/" + decodeURIComponent(projectId), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status })
+    });
+    toast("项目状态更新成功");
+    renderList();
+  } catch (e) {
+    toast("状态更新失败: " + e.message, "error");
+  }
 }
 
 function toggleGroup(id) {

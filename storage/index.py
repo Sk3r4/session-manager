@@ -63,6 +63,20 @@ class IndexDB:
                     error TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    path TEXT,
+                    status TEXT DEFAULT '活跃',
+                    created_at REAL,
+                    last_active_at REAL,
+                    session_count INTEGER DEFAULT 0,
+                    archived_count INTEGER DEFAULT 0,
+                    display_name TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_project_path ON projects(path)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_provider ON sessions(provider_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON sessions(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_last_active ON sessions(last_active_at)")
@@ -167,6 +181,75 @@ class IndexDB:
                 GROUP BY day ORDER BY day DESC
             """).fetchall()
             return {r["day"]: r["cnt"] for r in rows}
+
+    def sync_projects(self):
+        """从 sessions 表聚合 project_dir，同步到 projects 表。"""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT project_dir,
+                       COUNT(*) as session_count,
+                       MAX(last_active_at) as last_active_at,
+                       MIN(created_at) as created_at
+                FROM sessions
+                WHERE deleted = 0 AND project_dir IS NOT NULL AND project_dir != ''
+                GROUP BY project_dir
+            """).fetchall()
+            for r in rows:
+                path = r["project_dir"]
+                # 使用规范化路径作为 id
+                pid = path
+                existing = conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
+                if existing:
+                    conn.execute("""
+                        UPDATE projects SET
+                            session_count = ?,
+                            last_active_at = COALESCE(?, last_active_at),
+                            name = COALESCE(name, ?)
+                        WHERE id = ?
+                    """, (r["session_count"], r["last_active_at"], path, pid))
+                else:
+                    conn.execute("""
+                        INSERT INTO projects (id, name, path, status, created_at, last_active_at, session_count)
+                        VALUES (?, ?, ?, '活跃', ?, ?, ?)
+                    """, (pid, path, path, r["created_at"], r["last_active_at"], r["session_count"]))
+
+    def list_projects(self) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT * FROM projects ORDER BY last_active_at DESC NULLS LAST
+            """).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            return dict(row) if row else None
+
+    def update_project_status(self, project_id: str, status: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE projects SET status = ? WHERE id = ?", (status, project_id))
+
+    def update_project_display_name(self, project_id: str, display_name: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE projects SET display_name = ? WHERE id = ?", (display_name, project_id))
+
+    def get_project_sessions(self, project_dir: str, provider: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM sessions WHERE deleted = 0 AND project_dir = ?"
+        params = [project_dir]
+        if provider:
+            sql += " AND provider_id = ?"
+            params.append(provider)
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY pinned DESC, pinned_at DESC, last_active_at DESC NULLS LAST, created_at DESC"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
 
     def get_providers_summary(self) -> List[Dict[str, Any]]:
         with self._conn() as conn:

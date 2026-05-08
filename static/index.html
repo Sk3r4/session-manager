@@ -42,7 +42,7 @@
   <div id="stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></div>
 
   <!-- Filters -->
-  <div class="card p-4 mb-6 flex flex-col md:flex-row gap-3 items-stretch md:items-center">
+  <div class="card p-4 mb-6 flex flex-col md:flex-row gap-3 items-stretch md:items-center flex-wrap">
     <input id="searchInput" type="text" placeholder="搜索会话..." oninput="renderList()"
            class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
     <select id="providerFilter" onchange="renderList()" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
@@ -51,9 +51,17 @@
     <select id="statusFilter" onchange="renderList()" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
       <option value="">全部状态</option>
     </select>
+    <div class="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2">
+      <span class="text-xs text-slate-400">日期</span>
+      <input id="fromDate" type="date" onchange="renderList()" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500">
+      <span class="text-xs text-slate-500">-</span>
+      <input id="toDate" type="date" onchange="renderList()" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500">
+      <button onclick="clearDateFilter()" class="text-xs text-slate-400 hover:text-white ml-1">清除</button>
+    </div>
     <div class="flex bg-slate-900 border border-slate-700 rounded-lg overflow-hidden">
       <button onclick="setView('timeline')" id="btnTimeline" class="px-3 py-2 text-sm text-white bg-blue-600">时间线</button>
       <button onclick="setView('project')" id="btnProject" class="px-3 py-2 text-sm text-slate-400 hover:text-white">项目</button>
+      <button onclick="setView('calendar')" id="btnCalendar" class="px-3 py-2 text-sm text-slate-400 hover:text-white">日历</button>
     </div>
   </div>
 
@@ -85,7 +93,8 @@
 let sessions = [];
 let statusOptions = [];
 let providers = [];
-let currentView = "timeline"; // 'timeline' | 'project'
+let currentView = "timeline"; // 'timeline' | 'project' | 'calendar'
+let dailyStats = {};
 
 async function api(path, opts = {}) {
   const res = await fetch(`/api${path}`, opts);
@@ -106,6 +115,7 @@ async function init() {
   renderProviderFilter();
   renderStatusFilter();
   await loadStats();
+  await loadDailyStats();
   await loadSessions();
 }
 
@@ -146,12 +156,31 @@ function setView(view) {
   document.getElementById("btnProject").className = view === "project"
     ? "px-3 py-2 text-sm text-white bg-blue-600"
     : "px-3 py-2 text-sm text-slate-400 hover:text-white";
+  document.getElementById("btnCalendar").className = view === "calendar"
+    ? "px-3 py-2 text-sm text-white bg-blue-600"
+    : "px-3 py-2 text-sm text-slate-400 hover:text-white";
+  renderList();
+}
+
+async function loadDailyStats() {
+  try {
+    dailyStats = await api("/daily-stats");
+  } catch (e) {
+    dailyStats = {};
+  }
+}
+
+function clearDateFilter() {
+  document.getElementById("fromDate").value = "";
+  document.getElementById("toDate").value = "";
   renderList();
 }
 
 function renderList() {
   if (currentView === "project") {
     renderProjectView();
+  } else if (currentView === "calendar") {
+    renderCalendarView();
   } else {
     renderTimelineView();
   }
@@ -161,6 +190,13 @@ function getFilteredSessions() {
   const search = document.getElementById("searchInput").value.toLowerCase();
   const provider = document.getElementById("providerFilter").value;
   const status = document.getElementById("statusFilter").value;
+  const fromDate = document.getElementById("fromDate").value;
+  const toDate = document.getElementById("toDate").value;
+
+  let fromTs = null, toTs = null;
+  if (fromDate) fromTs = new Date(fromDate).getTime() / 1000;
+  if (toDate) toTs = new Date(toDate).getTime() / 1000 + 86400;
+
   return sessions.filter(s => {
     if (provider && s.provider_id !== provider) return false;
     if (status && s.status !== status) return false;
@@ -168,6 +204,8 @@ function getFilteredSessions() {
       const text = (s.display_name + " " + (s.summary||"") + " " + (s.project_dir||"")).toLowerCase();
       if (!text.includes(search)) return false;
     }
+    if (fromTs && s.last_active_at && s.last_active_at < fromTs) return false;
+    if (toTs && s.last_active_at && s.last_active_at >= toTs) return false;
     return true;
   });
 }
@@ -184,7 +222,93 @@ function renderTimelineView() {
   }
   empty.classList.add("hidden");
 
-  container.innerHTML = filtered.map(s => sessionCard(s)).join("");
+  // 按日期分组，插入日期分割线
+  let html = [];
+  let lastDay = null;
+  for (const s of filtered) {
+    const day = s.last_active_at ? fmtDay(s.last_active_at) : "未知日期";
+    if (day !== lastDay) {
+      html.push(`<div class="sticky top-0 z-10 my-4 flex items-center gap-3"><div class="h-px flex-1 bg-slate-700"></div><span class="text-xs font-medium text-slate-400 bg-slate-900 px-2">${day}</span><div class="h-px flex-1 bg-slate-700"></div></div>`);
+      lastDay = day;
+    }
+    html.push(sessionCard(s));
+  }
+  container.innerHTML = html.join("");
+}
+
+function fmtDay(ts) {
+  if (!ts) return "未知日期";
+  let d;
+  if (typeof ts === "number") {
+    d = ts > 1e12 ? new Date(ts) : new Date(ts * 1000);
+  } else {
+    d = new Date(ts);
+  }
+  if (isNaN(d.getTime())) return String(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+  return `${y}-${m}-${day} ${weekdays[d.getDay()]}`;
+}
+
+function renderCalendarView() {
+  const container = document.getElementById("sessionList");
+  const empty = document.getElementById("emptyState");
+
+  const entries = Object.entries(dailyStats).sort((a, b) => b[0].localeCompare(a[0]));
+  if (entries.length === 0) {
+    container.innerHTML = "";
+    empty.classList.remove("hidden");
+    empty.querySelector("p").textContent = "暂无会话数据，请点击右上角「扫描全部」开始。";
+    return;
+  }
+  empty.classList.add("hidden");
+
+  // 按年月分组
+  const months = {};
+  for (const [day, cnt] of entries) {
+    const ym = day.slice(0, 7);
+    if (!months[ym]) months[ym] = [];
+    months[ym].push({ day, cnt });
+  }
+
+  let html = [];
+  for (const [ym, days] of Object.entries(months).sort((a, b) => b[0].localeCompare(a[0]))) {
+    html.push(`<div class="card p-4 mb-4"><div class="text-sm font-medium text-white mb-3">${ym}</div><div class="grid grid-cols-7 gap-2">`);
+    // 填充该月所有日期（包括无会话的）
+    const [y, m] = ym.split("-").map(Number);
+    const dim = new Date(y, m, 0).getDate();
+    const firstDow = new Date(y, m - 1, 1).getDay();
+    // 星期标题
+    const wds = ["日", "一", "二", "三", "四", "五", "六"];
+    for (const wd of wds) {
+      html.push(`<div class="text-center text-xs text-slate-500 py-1">${wd}</div>`);
+    }
+    // 空白填充
+    for (let i = 0; i < firstDow; i++) {
+      html.push(`<div></div>`);
+    }
+    // 日期格子
+    const dayMap = Object.fromEntries(days.map(d => [d.day, d.cnt]));
+    for (let d = 1; d <= dim; d++) {
+      const ds = String(d).padStart(2, "0");
+      const key = `${ym}-${ds}`;
+      const cnt = dayMap[key] || 0;
+      const intensity = cnt === 0 ? "bg-slate-800" : cnt >= 5 ? "bg-blue-600" : cnt >= 3 ? "bg-blue-500/70" : "bg-blue-400/40";
+      const textColor = cnt === 0 ? "text-slate-500" : "text-white";
+      html.push(`<div class="${intensity} ${textColor} rounded-lg text-center py-2 cursor-pointer hover:ring-2 hover:ring-blue-400 transition" onclick="filterByDate('${key}')"><div class="text-xs font-medium">${d}</div>${cnt > 0 ? `<div class="text-[10px] mt-0.5">${cnt}</div>` : ""}</div>`);
+    }
+    html.push(`</div></div>`);
+  }
+  container.innerHTML = html.join("");
+}
+
+function filterByDate(day) {
+  document.getElementById("fromDate").value = day;
+  document.getElementById("toDate").value = day;
+  setView("timeline");
+  renderList();
 }
 
 function renderProjectView() {

@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -89,6 +90,7 @@ def scan_provider(provider_id: str):
                 raw_meta=json.dumps({"source_path": s.source_path, "title": s.title}, ensure_ascii=False),
             ))
         db.upsert_sessions(records)
+        db.sync_projects()
         db.log_scan(provider_id, len(records))
         return {"provider_id": provider_id, "found": len(records)}
     except Exception as e:
@@ -108,6 +110,7 @@ def scan_all():
             results.append({"provider_id": cfg["id"], **body})
         else:
             results.append(res)
+    db.sync_projects()
     return results
 
 @app.get("/api/sessions")
@@ -291,6 +294,78 @@ def unpin_session(session_id: str):
 @app.get("/api/daily-stats")
 def daily_stats():
     return db.get_daily_stats()
+
+@app.get("/api/projects")
+def list_projects():
+    rows = db.list_projects()
+    for r in rows:
+        r["display_name"] = r.get("display_name") or r.get("name") or r["id"]
+    return rows
+
+@app.get("/api/projects/{project_id}")
+def get_project(project_id: str):
+    row = db.get_project(project_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Project not found"})
+    row["display_name"] = row.get("display_name") or row.get("name") or row["id"]
+    return row
+
+class UpdateProjectReq(BaseModel):
+    status: Optional[str] = None
+    display_name: Optional[str] = None
+
+@app.put("/api/projects/{project_id}")
+def update_project(project_id: str, req: UpdateProjectReq):
+    if req.status is not None:
+        db.update_project_status(project_id, req.status)
+    if req.display_name is not None:
+        db.update_project_display_name(project_id, req.display_name)
+    row = db.get_project(project_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Project not found"})
+    row["display_name"] = row.get("display_name") or row.get("name") or row["id"]
+    return row
+
+@app.get("/api/projects/{project_id}/sessions")
+def get_project_sessions(project_id: str, provider: Optional[str] = Query(None), status: Optional[str] = Query(None)):
+    row = db.get_project(project_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Project not found"})
+    sessions = db.get_project_sessions(project_dir=row["path"], provider=provider, status=status)
+    for s in sessions:
+        s["display_name"] = s["title"] or s["session_id"]
+    return sessions
+
+@app.post("/api/projects/{project_id}/export")
+def export_project(project_id: str):
+    row = db.get_project(project_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Project not found"})
+
+    sessions = db.get_project_sessions(project_dir=row["path"])
+    configs = get_configs()
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for s in sessions:
+            cfg = next((c for c in configs if c["id"] == s["provider_id"]), None)
+            if not cfg:
+                continue
+            adapter = build_adapter(cfg)
+            messages = adapter.load_transcript(s["session_id"])
+            text = export_markdown(s, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
+            safe_name = _safe_filename(s.get("title") or s["session_id"])
+            zf.writestr(f"{safe_name}.md", text.encode("utf-8"))
+
+    buf.seek(0)
+    safe_project = _safe_filename(row.get("display_name") or row.get("name") or project_id)
+    filename = f"{safe_project}_sessions.zip"
+    encoded_name = quote(filename)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
+    )
 
 @app.get("/api/stats")
 def stats():

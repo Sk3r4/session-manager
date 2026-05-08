@@ -68,6 +68,7 @@ class IndexDB:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_last_active ON sessions(last_active_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pinned ON sessions(pinned)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted ON sessions(deleted)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_project_dir ON sessions(project_dir)")
 
     def upsert_sessions(self, records: List[SessionRecord]):
         with self._conn() as conn:
@@ -138,6 +139,34 @@ class IndexDB:
         with self._conn() as conn:
             cur = conn.execute("UPDATE sessions SET deleted = 1 WHERE id = ?", (session_id,))
             return cur.rowcount > 0
+
+    def list_sessions_by_date_range(self, from_ts: Optional[float] = None, to_ts: Optional[float] = None, project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM sessions WHERE deleted = 0"
+        params = []
+        if from_ts is not None:
+            sql += " AND last_active_at >= ?"
+            params.append(from_ts)
+        if to_ts is not None:
+            sql += " AND last_active_at < ?"
+            params.append(to_ts)
+        if project_dir is not None:
+            sql += " AND project_dir = ?"
+            params.append(project_dir)
+        sql += " ORDER BY pinned DESC, pinned_at DESC, last_active_at DESC NULLS LAST, created_at DESC"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_daily_stats(self) -> Dict[str, int]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT DATE(datetime(last_active_at, 'unixepoch', 'localtime')) as day, COUNT(*) as cnt
+                FROM sessions WHERE deleted = 0 AND last_active_at IS NOT NULL
+                GROUP BY day ORDER BY day DESC
+            """).fetchall()
+            return {r["day"]: r["cnt"] for r in rows}
 
     def get_providers_summary(self) -> List[Dict[str, Any]]:
         with self._conn() as conn:

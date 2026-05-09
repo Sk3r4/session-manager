@@ -402,6 +402,100 @@ def unpin_session(session_id: str):
 def daily_stats():
     return db.get_daily_stats()
 
+from datetime import datetime, timedelta
+
+@app.get("/api/daily-archive/{date}")
+def get_daily_archive(date: str):
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "Invalid date format, expected YYYY-MM-DD"})
+    
+    start_ts = dt.timestamp()
+    end_ts = (dt + timedelta(days=1)).timestamp()
+    rows = db.list_sessions_by_date_range(from_ts=start_ts, to_ts=end_ts)
+    
+    projects = {}
+    orphan_sessions = []
+    for r in rows:
+        r["display_name"] = r["title"] or r["session_id"]
+        if r.get("project_dir"):
+            pid = r["project_dir"]
+            if pid not in projects:
+                # 尝试获取项目的显示名
+                proj = db.get_project(pid)
+                display_name = proj.get("display_name") or proj.get("name") or pid if proj else pid
+                projects[pid] = {
+                    "display_name": display_name,
+                    "path": pid,
+                    "sessions": [],
+                    "summaries": [],
+                    "session_count": 0,
+                    "last_active": None,
+                }
+            projects[pid]["sessions"].append(r["id"])
+            if r.get("summary"):
+                projects[pid]["summaries"].append(r["summary"][:200])
+            projects[pid]["session_count"] += 1
+            if r.get("last_active_at"):
+                if projects[pid]["last_active"] is None or r["last_active_at"] > projects[pid]["last_active"]:
+                    projects[pid]["last_active"] = r["last_active_at"]
+        else:
+            orphan_sessions.append({
+                "id": r["id"],
+                "display_name": r["display_name"],
+                "provider_id": r["provider_id"],
+                "summary": r.get("summary"),
+                "last_active_at": r.get("last_active_at"),
+            })
+    
+    # 转换 last_active 为 ISO 字符串
+    for p in projects.values():
+        if p["last_active"]:
+            p["last_active"] = datetime.fromtimestamp(p["last_active"]).isoformat()
+    
+    return {
+        "date": date,
+        "projects": projects,
+        "orphan_sessions": orphan_sessions,
+        "total_sessions": len(rows),
+    }
+
+@app.get("/api/daily-archive/{date}/export")
+def export_daily_archive(date: str):
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "Invalid date format, expected YYYY-MM-DD"})
+    
+    start_ts = dt.timestamp()
+    end_ts = (dt + timedelta(days=1)).timestamp()
+    rows = db.list_sessions_by_date_range(from_ts=start_ts, to_ts=end_ts)
+    configs = get_configs()
+    
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in rows:
+            cfg = next((c for c in configs if c["id"] == r["provider_id"]), None)
+            if not cfg:
+                continue
+            adapter = build_adapter(cfg)
+            messages = adapter.load_transcript(r["session_id"])
+            text = export_markdown(r, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
+            safe_name = _safe_filename(r.get("title") or r["session_id"])
+            # 按项目分组存放
+            project_name = _safe_filename(r.get("project_dir") or "未归类")
+            zf.writestr(f"{project_name}/{safe_name}.md", text.encode("utf-8"))
+    
+    buf.seek(0)
+    filename = f"daily_archive_{date}.zip"
+    encoded_name = quote(filename)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
+    )
+
 @app.get("/api/projects")
 def list_projects():
     rows = db.list_projects()

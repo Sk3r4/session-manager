@@ -16,14 +16,16 @@ from urllib.parse import quote
 from fastapi.responses import Response, FileResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
-from config import DEFAULT_PROVIDER_CONFIGS, STATUS_OPTIONS, DATA_DIR
+from config import DEFAULT_PROVIDER_CONFIGS, STATUS_OPTIONS, DATA_DIR, ARCHIVE_DIR, ARCHIVE_MAPPINGS
 from storage.index import IndexDB, SessionRecord
 from adapters import build_adapter
 from exporter import export_markdown, export_pdf, _safe_filename
+from archiver import SessionArchiver
 
 app = FastAPI(title="Session Manager", version="0.1.0")
 
 db = IndexDB()
+archiver = SessionArchiver(ARCHIVE_DIR, ARCHIVE_MAPPINGS)
 
 # 加载/持久化用户自定义 provider 配置
 CONFIG_PATH = DATA_DIR / "providers.json"
@@ -89,10 +91,27 @@ def scan_provider(provider_id: str):
                 source_path=s.source_path,
                 raw_meta=json.dumps({"source_path": s.source_path, "title": s.title}, ensure_ascii=False),
             ))
-        db.upsert_sessions(records)
+        inserted, updated = db.upsert_sessions(records)
         db.sync_projects()
+
+        # 自动归档新插入的会话
+        archived_count = 0
+        for sid in inserted:
+            if db.is_archived(sid):
+                continue
+            row = db.get_session(sid)
+            if not row:
+                continue
+            try:
+                messages = adapter.load_transcript(row["session_id"])
+                path = archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
+                db.record_archive(sid, str(path), len(messages))
+                archived_count += 1
+            except Exception as e:
+                print(f"Auto-archive failed for {sid}: {e}")
+
         db.log_scan(provider_id, len(records))
-        return {"provider_id": provider_id, "found": len(records)}
+        return {"provider_id": provider_id, "found": len(records), "archived": archived_count}
     except Exception as e:
         db.log_scan(provider_id, 0, str(e))
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -161,10 +180,24 @@ def get_session(session_id: str):
     return row
 
 @app.get("/api/sessions/{session_id}/transcript")
-def get_transcript(session_id: str):
+def get_transcript(session_id: str, use_archive: bool = Query(False)):
     row = db.get_session(session_id)
     if not row:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+    # 如果请求归档版本且已归档，返回归档的 Markdown
+    if use_archive:
+        archive_row = db.get_archive(session_id)
+        if archive_row:
+            md_text = archiver.load_archived_transcript(row)
+            if md_text:
+                return {
+                    "session_id": session_id,
+                    "provider_id": row["provider_id"],
+                    "from_archive": True,
+                    "markdown": md_text,
+                }
+
     configs = get_configs()
     cfg = next((c for c in configs if c["id"] == row["provider_id"]), None)
     if not cfg:
@@ -174,8 +207,82 @@ def get_transcript(session_id: str):
     return {
         "session_id": session_id,
         "provider_id": row["provider_id"],
+        "from_archive": False,
         "messages": [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages]
     }
+
+@app.get("/api/sessions/{session_id}/archive-status")
+def get_archive_status(session_id: str):
+    row = db.get_session(session_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    archive_row = db.get_archive(session_id)
+    info = archiver.get_archive_info(row)
+    return {
+        "session_id": session_id,
+        "is_archived": archive_row is not None,
+        "archive_path": archive_row["archive_path"] if archive_row else None,
+        "archived_at": archive_row["archived_at"] if archive_row else None,
+        "message_count": archive_row["message_count"] if archive_row else None,
+        "file_exists": info is not None,
+    }
+
+@app.post("/api/sessions/{session_id}/archive")
+def archive_session(session_id: str):
+    row = db.get_session(session_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    if db.is_archived(session_id):
+        return {"archived": True, "session_id": session_id, "message": "Already archived"}
+
+    configs = get_configs()
+    cfg = next((c for c in configs if c["id"] == row["provider_id"]), None)
+    if not cfg:
+        return JSONResponse(status_code=404, content={"error": "Provider config not found"})
+    adapter = build_adapter(cfg)
+    messages = adapter.load_transcript(row["session_id"])
+    path = archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
+    db.record_archive(session_id, str(path), len(messages))
+    return {"archived": True, "session_id": session_id, "path": str(path), "message_count": len(messages)}
+
+class BatchArchiveReq(BaseModel):
+    session_ids: Optional[List[str]] = None
+    provider: Optional[str] = None
+    project_dir: Optional[str] = None
+
+@app.post("/api/archive/batch")
+def batch_archive(req: BatchArchiveReq):
+    if req.session_ids:
+        targets = [db.get_session(sid) for sid in req.session_ids]
+        targets = [t for t in targets if t]
+    elif req.provider or req.project_dir:
+        targets = db.list_sessions_by_date_range(project_dir=req.project_dir)
+        if req.provider:
+            targets = [t for t in targets if t["provider_id"] == req.provider]
+        targets = [t for t in targets if not db.is_archived(t["id"])]
+    else:
+        targets = db.list_unarchived_sessions()
+
+    configs = get_configs()
+    archived = []
+    failed = []
+    for row in targets:
+        if db.is_archived(row["id"]):
+            continue
+        cfg = next((c for c in configs if c["id"] == row["provider_id"]), None)
+        if not cfg:
+            failed.append({"id": row["id"], "reason": "Provider config not found"})
+            continue
+        adapter = build_adapter(cfg)
+        try:
+            messages = adapter.load_transcript(row["session_id"])
+            path = archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
+            db.record_archive(row["id"], str(path), len(messages))
+            archived.append(row["id"])
+        except Exception as e:
+            failed.append({"id": row["id"], "reason": str(e)})
+
+    return {"archived": archived, "failed": failed, "total": len(targets)}
 
 @app.get("/api/sessions/{session_id}/copy-command")
 def copy_command(session_id: str):

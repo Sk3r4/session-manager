@@ -33,9 +33,14 @@
       <h1 class="text-2xl font-bold text-white">Session Manager</h1>
       <p class="text-slate-400 text-sm mt-1">统一管理 Codex / Claude Code / Kimi Code 本地会话</p>
     </div>
-    <button onclick="scanAll()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition">
-      扫描全部
-    </button>
+    <div class="flex gap-2">
+      <button onclick="batchArchive()" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition">
+        批量归档
+      </button>
+      <button onclick="scanAll()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition">
+        扫描全部
+      </button>
+    </div>
   </div>
 
   <!-- Stats -->
@@ -503,6 +508,7 @@ function sessionCard(s) {
           ${statusOptions.map(opt => `<option value="${opt}" ${opt === s.status ? 'selected' : ''}>${opt}</option>`).join('')}
         </select>
         <button onclick="event.stopPropagation(); copyCommand('${s.id}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">复制命令</button>
+        <button onclick="event.stopPropagation(); archiveOne('${s.id}')" class="text-xs px-2 py-1 bg-purple-900/50 hover:bg-purple-700 rounded text-purple-200" title="归档备份">归档</button>
         <button onclick="event.stopPropagation(); deleteSession('${s.id}')" class="text-xs px-2 py-1 bg-red-900/50 hover:bg-red-700 rounded text-red-200" title="从列表中删除">删除</button>
       </div>
     </div>
@@ -651,41 +657,63 @@ async function openDetail(id) {
   const content = document.getElementById("detailContent");
   content.innerHTML = `<div class="text-slate-400">加载中...</div>`;
 
+  // 同时加载归档状态
+  let archiveStatus = null;
   try {
-    const transcript = await api(`/sessions/${id}/transcript`);
+    archiveStatus = await api(`/sessions/${id}/archive-status`);
+  } catch (e) {}
+
+  try {
+    let transcript;
+    if (archiveStatus && archiveStatus.is_archived) {
+      transcript = await api(`/sessions/${id}/transcript?use_archive=1`);
+    } else {
+      transcript = await api(`/sessions/${id}/transcript`);
+    }
     const dateStr = s.last_active_at ? fmtDate(s.last_active_at) : "未知";
     const createdStr = s.created_at ? fmtDate(s.created_at) : "未知";
 
-    const showFull = window._showFullContent || false;
-    const filteredMsgs = showFull
-      ? transcript.messages
-      : transcript.messages.filter(m => {
-          const role = m.role || "";
-          return (role === "user" || role === "assistant") && (m.content || "").trim().length > 0;
-        });
-
-    let messagesHtml = filteredMsgs.map(m => {
-      const cls = `message-${m.role}`;
-      const ts = (() => {
-        if (!m.ts) return "";
-        let d;
-        if (typeof m.ts === "number") {
-          d = m.ts > 1e12 ? new Date(m.ts) : new Date(m.ts * 1000);
-        } else {
-          d = new Date(m.ts);
-        }
-        return isNaN(d.getTime()) ? "" : d.toLocaleTimeString("zh-CN");
-      })();
-      return `
-        <div class="${cls} rounded-lg p-3 mb-3">
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-bold uppercase tracking-wide text-slate-300">${m.role}</span>
-            ${ts ? `<span class="text-xs text-slate-500">${ts}</span>` : ""}
-          </div>
-          <pre class="text-sm text-slate-200 whitespace-pre-wrap font-sans">${escapeHtml(m.content)}</pre>
+    let messagesHtml = "";
+    if (transcript.from_archive && transcript.markdown) {
+      // 归档版本：显示 Markdown 内容
+      messagesHtml = `
+        <div class="message-system rounded-lg p-3 mb-3">
+          <div class="text-xs font-bold uppercase tracking-wide text-slate-300 mb-2">📦 归档版本（完整对话）</div>
+          <pre class="text-sm text-slate-200 whitespace-pre-wrap font-sans">${escapeHtml(transcript.markdown)}</pre>
         </div>
       `;
-    }).join("");
+    } else if (transcript.messages) {
+      const showFull = window._showFullContent || false;
+      const filteredMsgs = showFull
+        ? transcript.messages
+        : transcript.messages.filter(m => {
+            const role = m.role || "";
+            return (role === "user" || role === "assistant") && (m.content || "").trim().length > 0;
+          });
+
+      messagesHtml = filteredMsgs.map(m => {
+        const cls = `message-${m.role}`;
+        const ts = (() => {
+          if (!m.ts) return "";
+          let d;
+          if (typeof m.ts === "number") {
+            d = m.ts > 1e12 ? new Date(m.ts) : new Date(m.ts * 1000);
+          } else {
+            d = new Date(m.ts);
+          }
+          return isNaN(d.getTime()) ? "" : d.toLocaleTimeString("zh-CN");
+        })();
+        return `
+          <div class="${cls} rounded-lg p-3 mb-3">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs font-bold uppercase tracking-wide text-slate-300">${m.role}</span>
+              ${ts ? `<span class="text-xs text-slate-500">${ts}</span>` : ""}
+            </div>
+            <pre class="text-sm text-slate-200 whitespace-pre-wrap font-sans">${escapeHtml(m.content)}</pre>
+          </div>
+        `;
+      }).join("");
+    }
 
     if (!messagesHtml) messagesHtml = `<div class="text-slate-500">无法解析对话内容或内容为空。</div>`;
 
@@ -721,11 +749,14 @@ async function openDetail(id) {
         <button onclick="copyCommand('${s.id}')" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm text-white">复制恢复命令</button>
         <button onclick="exportSession('${s.id}', 'md')" class="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-sm text-white">导出 Markdown</button>
         <button onclick="exportSession('${s.id}', 'pdf')" class="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 rounded text-sm text-white">导出 PDF</button>
+        <button onclick="archiveOne('${s.id}')" class="px-3 py-1.5 bg-purple-800 hover:bg-purple-700 rounded text-sm text-white">归档备份</button>
+        <button onclick="viewArchive('${s.id}')" id="btnViewArchive-${s.id}" class="hidden px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white">查看归档版本</button>
         <button onclick="renameSession('${s.id}', '${escapeHtml(s.display_name)}')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white">重命名</button>
         <select onchange="changeStatus('${s.id}', this.value)" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white border-none cursor-pointer outline-none">
           ${statusOptions.map(opt => `<option value="${opt}" ${opt === s.status ? 'selected' : ''}>${opt}</option>`).join('')}
         </select>
       </div>
+      <div id="archiveStatus-${s.id}" class="mb-4"></div>
       <div class="mb-4 flex items-center justify-between">
         <span class="text-xs text-slate-400">对话内容</span>
         <button onclick="toggleFullContent('${s.id}')" class="text-xs px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-slate-300">
@@ -735,6 +766,19 @@ async function openDetail(id) {
       <hr class="border-slate-700 my-4">
       <div>${messagesHtml}</div>
     `;
+
+    // 填充归档状态
+    if (archiveStatus) {
+      const statusEl = document.getElementById(`archiveStatus-${s.id}`);
+      const btn = document.getElementById(`btnViewArchive-${s.id}`);
+      if (archiveStatus.is_archived) {
+        const archivedAt = archiveStatus.archived_at ? new Date(archiveStatus.archived_at * 1000).toLocaleString("zh-CN") : "未知";
+        if (statusEl) statusEl.innerHTML = `<div class="text-xs text-green-400">✅ 已归档 (${archiveStatus.message_count} 条消息) · ${archivedAt}</div>`;
+        if (btn) btn.classList.remove("hidden");
+      } else {
+        if (statusEl) statusEl.innerHTML = `<div class="text-xs text-slate-500">⚠️ 未归档（CLI compacting 后可能丢失原始对话）</div>`;
+      }
+    }
   } catch (e) {
     content.innerHTML = `<div class="text-red-400">加载失败: ${e.message}</div>`;
   }
@@ -743,6 +787,65 @@ async function openDetail(id) {
 function toggleFullContent(id) {
   window._showFullContent = !window._showFullContent;
   openDetail(id);
+}
+
+async function archiveOne(id) {
+  try {
+    const res = await api(`/sessions/${id}/archive`, { method: "POST" });
+    toast(`已归档: ${res.message_count} 条消息`);
+    // 刷新详情中的归档状态
+    const statusEl = document.getElementById(`archiveStatus-${id}`);
+    if (statusEl) statusEl.innerHTML = `<div class="text-xs text-green-400">✅ 已归档 (${res.message_count} 条消息)</div>`;
+    const btn = document.getElementById(`btnViewArchive-${id}`);
+    if (btn) btn.classList.remove("hidden");
+  } catch (e) {
+    toast("归档失败: " + e.message, "error");
+  }
+}
+
+async function viewArchive(id) {
+  // 重新打开详情，强制使用归档版本
+  try {
+    const transcript = await api(`/sessions/${id}/transcript?use_archive=1`);
+    if (transcript.markdown) {
+      const modal = document.getElementById("detailModal");
+      const content = document.getElementById("detailContent");
+      modal.classList.remove("hidden");
+      content.innerHTML = `
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-lg font-semibold text-white">📦 归档版本</h2>
+          <button onclick="closeModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+        </div>
+        <div class="message-system rounded-lg p-3 mb-3">
+          <pre class="text-sm text-slate-200 whitespace-pre-wrap font-sans">${escapeHtml(transcript.markdown)}</pre>
+        </div>
+      `;
+    }
+  } catch (e) {
+    toast("加载归档版本失败: " + e.message, "error");
+  }
+}
+
+async function batchArchive() {
+  const provider = document.getElementById("providerFilter").value;
+  const projectDir = document.getElementById("projectFilter")?.value;
+  const scope = provider || projectDir ? "当前筛选" : "全部未归档";
+  if (!confirm(`确定要批量归档 ${scope} 的会话吗？`)) return;
+
+  toast("开始批量归档...");
+  try {
+    const body = {};
+    if (provider) body.provider = provider;
+    if (projectDir) body.project_dir = projectDir;
+    const res = await api("/archive/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    toast(`批量归档完成: ${res.archived.length} 个成功, ${res.failed.length} 个失败`);
+  } catch (e) {
+    toast("批量归档失败: " + e.message, "error");
+  }
 }
 
 function closeModal() {

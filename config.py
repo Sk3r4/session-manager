@@ -41,4 +41,10 @@ DEFAULT_PROVIDER_CONFIGS: List[Dict[str, Any]] = [
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 INDEX_DB_PATH = DATA_DIR / "index.db"
+ARCHIVE_DIR = DATA_DIR / "archives"
+ARCHIVE_DIR.mkdir(exist_ok=True)
 STATUS_OPTIONS = ["未标注", "进行中", "已完成", "待跟进", "已归档"]
+
+# 自定义归档目录映射：project_dir -> archive_dir
+# 示例：{ "D:\\Webtools\\10-Projects\\01-活跃\\Phage": "D:\\Webtools\\10-Projects\\01-活跃\\Phage\\sessions" }
+ARCHIVE_MAPPINGS: dict = {}

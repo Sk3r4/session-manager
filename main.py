@@ -104,6 +104,7 @@ def scan_provider(provider_id: str):
                 continue
             try:
                 messages = adapter.load_transcript(row["session_id"])
+                # 即使 messages 为空（compacted）也执行元数据归档，保留 session 存在记录
                 path = archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
                 db.record_archive(sid, str(path), len(messages))
                 archived_count += 1
@@ -241,6 +242,7 @@ def archive_session(session_id: str):
         return JSONResponse(status_code=404, content={"error": "Provider config not found"})
     adapter = build_adapter(cfg)
     messages = adapter.load_transcript(row["session_id"])
+    # 即使 messages 为空（compacted）也执行元数据归档
     path = archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
     db.record_archive(session_id, str(path), len(messages))
     return {"archived": True, "session_id": session_id, "path": str(path), "message_count": len(messages)}
@@ -294,7 +296,12 @@ def copy_command(session_id: str):
     if not cfg:
         return JSONResponse(status_code=404, content={"error": "Provider config not found"})
     adapter = build_adapter(cfg)
-    cmd = adapter.get_resume_command(row["session_id"])
+    raw_sid = row["session_id"]
+    project_dir = row.get("project_dir") or adapter.get_project_dir(raw_sid)
+    if project_dir and Path(project_dir).exists():
+        cmd = f'kimi -r "{raw_sid}"'
+    else:
+        cmd = adapter.get_resume_command(raw_sid)
     return {"command": cmd}
 
 @app.post("/api/sessions/{session_id}/launch")
@@ -307,8 +314,15 @@ def launch_session(session_id: str):
     if not cfg:
         return JSONResponse(status_code=404, content={"error": "Provider config not found"})
     adapter = build_adapter(cfg)
-    cmd = adapter.get_resume_command(row["session_id"])
-    project_dir = row.get("project_dir") or adapter.get_project_dir(row["session_id"])
+    raw_sid = row["session_id"]
+    project_dir = row.get("project_dir") or adapter.get_project_dir(raw_sid)
+
+    # 优先使用数据库中的 project_dir 生成带 ID 的 resume 命令
+    # 只有当 project_dir 确实未知时才降级为交互式选择
+    if project_dir and Path(project_dir).exists():
+        cmd = f'kimi -r "{raw_sid}"'
+    else:
+        cmd = adapter.get_resume_command(raw_sid)
 
     # 构建 PowerShell 命令
     # 先设置 UTF-8 编码避免中文乱码/崩溃，再执行 resume 命令

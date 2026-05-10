@@ -45,6 +45,11 @@ def export_markdown(session: dict, messages: List[Dict[str, Any]]) -> str:
     lines.append("## 对话记录")
     lines.append("")
 
+    if not messages:
+        lines.append("> ⚠️ **此会话的消息已被 Kimi CLI compacting 清除，原始对话内容已不可恢复。**")
+        lines.append("> 归档时间仅保留了会话元数据（标题、时间、项目目录等）。")
+        lines.append("")
+
     for m in messages:
         role = m.get("role", "unknown")
         content = m.get("content", "") or ""

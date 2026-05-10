@@ -39,10 +39,11 @@ class SessionArchiver:
         """归档单个会话。返回归档后的 Markdown 文件路径。"""
         archive_dir = self._get_archive_dir(session)
         session_id = session["id"]
+        safe_id = self._safe_filename(session_id)
         safe_name = self._safe_filename(session.get("title") or session.get("session_id", "unknown"))
 
-        md_path = archive_dir / f"{safe_name}_{session_id}.md"
-        meta_path = archive_dir / f"{safe_name}_{session_id}.meta.json"
+        md_path = archive_dir / f"{safe_name}_{safe_id}.md"
+        meta_path = archive_dir / f"{safe_name}_{safe_id}.meta.json"
 
         # 导出 Markdown
         md_text = export_markdown(session, messages)
@@ -65,9 +66,10 @@ class SessionArchiver:
         """检查某个会话是否已归档，返回归档元数据。"""
         archive_dir = self._get_archive_dir(session)
         session_id = session["id"]
+        safe_id = self._safe_filename(session_id)
         safe_name = self._safe_filename(session.get("title") or session.get("session_id", "unknown"))
 
-        meta_path = archive_dir / f"{safe_name}_{session_id}.meta.json"
+        meta_path = archive_dir / f"{safe_name}_{safe_id}.meta.json"
         if meta_path.exists():
             try:
                 return json.loads(meta_path.read_text(encoding="utf-8"))
@@ -79,9 +81,10 @@ class SessionArchiver:
         """加载已归档的 Markdown 内容。"""
         archive_dir = self._get_archive_dir(session)
         session_id = session["id"]
+        safe_id = self._safe_filename(session_id)
         safe_name = self._safe_filename(session.get("title") or session.get("session_id", "unknown"))
 
-        md_path = archive_dir / f"{safe_name}_{session_id}.md"
+        md_path = archive_dir / f"{safe_name}_{safe_id}.md"
         if md_path.exists():
             try:
                 return md_path.read_text(encoding="utf-8")

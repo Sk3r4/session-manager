@@ -35,7 +35,13 @@
     </div>
     <div class="flex gap-2">
       <button onclick="batchArchive()" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition">
-        批量归档
+        批量归档 (<span id="selectedCount">0</span>)
+      </button>
+      <button onclick="selectAllVisible()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-sm font-medium transition">
+        全选本页
+      </button>
+      <button onclick="clearSelection()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-sm font-medium transition">
+        清空选择
       </button>
       <button onclick="scanAll()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition">
         扫描全部
@@ -100,11 +106,26 @@ let statusOptions = [];
 let providers = [];
 let currentView = "timeline"; // 'timeline' | 'project' | 'calendar'
 let dailyStats = {};
+let selectedIds = new Set();
 
 async function api(path, opts = {}) {
   const res = await fetch(`/api${path}`, opts);
-  if (!res.ok) throw new Error((await res.json()).error || "请求失败");
+  if (!res.ok) {
+    let msg = "请求失败";
+    try {
+      const err = await res.json();
+      msg = err.error || err.detail || msg;
+    } catch (_) {
+      msg = res.statusText || `HTTP ${res.status}`;
+    }
+    throw new Error(msg);
+  }
   return res.json();
+}
+
+function escapeJs(str) {
+  if (!str) return "";
+  return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
 }
 
 function toast(msg, type = "info") {
@@ -487,23 +508,27 @@ function sessionCard(s) {
   const dirStr = s.project_dir ? `<span class="text-xs text-slate-500 ml-2">📁 ${s.project_dir}</span>` : "";
   const pinIcon = s.pinned ? "⭐" : "☆";
   const pinClass = s.pinned ? "text-yellow-400" : "text-slate-600 hover:text-yellow-400";
+  const isSelected = selectedIds.has(s.id);
   return `
   <div class="card p-4 hover:border-slate-500 transition cursor-pointer fade-in ${s.pinned ? 'border-yellow-600/50' : ''}" onclick="openDetail('${s.id}')">
     <div class="flex items-start justify-between">
-      <div class="flex-1 min-w-0">
-        <div class="flex items-center gap-2 flex-wrap">
-          <span class="text-xs font-semibold text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded">${s.provider_id}</span>
-          <span class="tag tag-${s.status}">${s.status}</span>
-          ${s.pinned ? '<span class="text-xs">⭐ 已置顶</span>' : ''}
-          ${currentView === 'timeline' ? dirStr : ''}
+      <div class="flex items-start gap-3 min-w-0 flex-1">
+        <input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleSelect('${s.id}')" class="mt-1 w-4 h-4 rounded border-slate-600 bg-slate-800 text-purple-600 focus:ring-purple-500 cursor-pointer">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-xs font-semibold text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded">${s.provider_id}</span>
+            <span class="tag tag-${s.status}">${s.status}</span>
+            ${s.pinned ? '<span class="text-xs">⭐ 已置顶</span>' : ''}
+            ${currentView === 'timeline' ? dirStr : ''}
+          </div>
+          <div class="mt-1 font-medium text-white truncate">${escapeHtml(s.display_name)}</div>
+          ${s.summary ? `<div class="text-sm text-slate-400 mt-1 line-clamp-1">${escapeHtml(s.summary)}</div>` : ""}
+          <div class="text-xs text-slate-500 mt-2">${dateStr}</div>
         </div>
-        <div class="mt-1 font-medium text-white truncate">${escapeHtml(s.display_name)}</div>
-        ${s.summary ? `<div class="text-sm text-slate-400 mt-1 line-clamp-1">${escapeHtml(s.summary)}</div>` : ""}
-        <div class="text-xs text-slate-500 mt-2">${dateStr}</div>
       </div>
       <div class="ml-4 flex flex-col gap-2">
         <button onclick="event.stopPropagation(); togglePin('${s.id}', ${s.pinned ? 1 : 0})" class="text-lg leading-none ${pinClass}" title="${s.pinned ? '取消置顶' : '置顶'}">${pinIcon}</button>
-        <button onclick="event.stopPropagation(); renameSession('${s.id}', '${escapeHtml(s.display_name)}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">重命名</button>
+        <button onclick="event.stopPropagation(); renameSession('${s.id}', '${escapeJs(s.display_name)}')" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white">重命名</button>
         <select onchange="event.stopPropagation(); changeStatus('${s.id}', this.value)" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-white border-none cursor-pointer outline-none">
           ${statusOptions.map(opt => `<option value="${opt}" ${opt === s.status ? 'selected' : ''}>${opt}</option>`).join('')}
         </select>
@@ -672,6 +697,7 @@ async function openDetail(id) {
     }
     const dateStr = s.last_active_at ? fmtDate(s.last_active_at) : "未知";
     const createdStr = s.created_at ? fmtDate(s.created_at) : "未知";
+    const showFull = window._showFullContent || false;
 
     let messagesHtml = "";
     if (transcript.from_archive && transcript.markdown) {
@@ -683,7 +709,6 @@ async function openDetail(id) {
         </div>
       `;
     } else if (transcript.messages) {
-      const showFull = window._showFullContent || false;
       const filteredMsgs = showFull
         ? transcript.messages
         : transcript.messages.filter(m => {
@@ -826,23 +851,53 @@ async function viewArchive(id) {
   }
 }
 
+function toggleSelect(id) {
+  if (selectedIds.has(id)) {
+    selectedIds.delete(id);
+  } else {
+    selectedIds.add(id);
+  }
+  updateSelectedCount();
+  // 重新渲染当前视图以更新 checkbox 状态
+  renderList();
+}
+
+function clearSelection() {
+  selectedIds.clear();
+  updateSelectedCount();
+  renderList();
+}
+
+function selectAllVisible() {
+  const visible = getFilteredSessions();
+  visible.forEach(s => selectedIds.add(s.id));
+  updateSelectedCount();
+  renderList();
+}
+
+function updateSelectedCount() {
+  const el = document.getElementById("selectedCount");
+  if (el) el.textContent = selectedIds.size;
+}
+
 async function batchArchive() {
-  const provider = document.getElementById("providerFilter").value;
-  const projectDir = document.getElementById("projectFilter")?.value;
-  const scope = provider || projectDir ? "当前筛选" : "全部未归档";
-  if (!confirm(`确定要批量归档 ${scope} 的会话吗？`)) return;
+  if (selectedIds.size === 0) {
+    toast("请先勾选要归档的会话", "error");
+    return;
+  }
+  if (!confirm(`确定要批量归档选中的 ${selectedIds.size} 个会话吗？`)) return;
 
   toast("开始批量归档...");
   try {
-    const body = {};
-    if (provider) body.provider = provider;
-    if (projectDir) body.project_dir = projectDir;
     const res = await api("/archive/batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify({ session_ids: Array.from(selectedIds) })
     });
     toast(`批量归档完成: ${res.archived.length} 个成功, ${res.failed.length} 个失败`);
+    selectedIds.clear();
+    updateSelectedCount();
+    await loadSessions();
   } catch (e) {
     toast("批量归档失败: " + e.message, "error");
   }

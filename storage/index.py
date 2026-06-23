@@ -225,6 +225,7 @@ class IndexDB:
                     ON CONFLICT(id) DO UPDATE SET
                         provider_id=excluded.provider_id,
                         session_id=excluded.session_id,
+                        title=COALESCE(sessions.title, excluded.title),
                         summary=COALESCE(sessions.summary, excluded.summary),
                         project_dir=COALESCE(excluded.project_dir, sessions.project_dir),
                         created_at=COALESCE(excluded.created_at, sessions.created_at),

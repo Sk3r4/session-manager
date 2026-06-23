@@ -15,6 +15,10 @@ python-dotenv>=1.2.0
 # HTTP
 httpx>=0.28.0
 
+# 实时通信
+websockets>=16.0
+watchdog>=6.0
+
 # LLM (session review)
 openai>=1.0.0
 pyyaml>=6.0

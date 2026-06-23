@@ -31,7 +31,7 @@
   <div class="flex items-center justify-between mb-6">
     <div>
       <h1 class="text-2xl font-bold text-white">Session Manager</h1>
-      <p class="text-slate-400 text-sm mt-1">统一管理 Codex / Claude Code / Kimi Code 本地会话</p>
+      <p class="text-slate-400 text-sm mt-1">统一管理 Codex / Claude Code / Kimi Code 本地会话 <span id="wsStatus" class="ml-2 text-slate-600 text-xs">⚫</span></p>
     </div>
     <div class="flex gap-2">
       <button onclick="batchArchive()" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition">
@@ -136,6 +136,41 @@ function toast(msg, type = "info") {
   setTimeout(() => { el.classList.add("opacity-0"); setTimeout(() => el.classList.add("hidden"), 300); }, 2500);
 }
 
+let wsReconnectTimer = null;
+
+function connectWebSocket() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const statusEl = document.getElementById("wsStatus");
+
+  ws.onopen = () => {
+    if (statusEl) statusEl.innerHTML = '<span class="text-green-400">🟢</span>';
+    // 清除重连定时器
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      if (data.type === "new_session") {
+        toast(`新会话: ${escapeHtml(data.title)}`, "info");
+        // 刷新会话列表（轻量：重新加载而非全页刷新）
+        loadSessions();
+      }
+    } catch (_) {}
+  };
+
+  ws.onclose = () => {
+    if (statusEl) statusEl.innerHTML = '<span class="text-amber-400">🟡</span>';
+    // 5s 后自动重连
+    wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+  };
+
+  ws.onerror = () => {
+    if (statusEl) statusEl.innerHTML = '<span class="text-red-400">🔴</span>';
+  };
+}
+
 async function init() {
   providers = await api("/providers");
   statusOptions = await api("/status-options");
@@ -144,6 +179,7 @@ async function init() {
   await loadStats();
   await loadDailyStats();
   await loadSessions();
+  connectWebSocket();
 }
 
 function renderProviderFilter() {

@@ -1,17 +1,21 @@
-﻿import base64
+﻿import asyncio
+import base64
 import io
 import json
 import logging
 import os
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fastapi import FastAPI, Query, Body
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Query, Body, WebSocket
 from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote
 
@@ -24,14 +28,43 @@ from adapters import build_adapter
 from exporter import export_markdown, export_pdf, _safe_filename
 from archiver import SessionArchiver
 from handoff import HandoffController
+from watcher import SessionWatcher, WebSocketManager
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Session Manager", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global watcher
+    # 启动文件监听
+    configs = get_configs()
+    watch_paths: dict = {}
+    for cfg in configs:
+        if cfg.get("enabled", True):
+            paths = set()
+            for sp in cfg.get("scan_paths", []):
+                p = Path(sp)
+                if p.exists():
+                    paths.add(str(p))
+            if paths:
+                watch_paths[cfg["id"]] = paths
+    watcher = SessionWatcher(watch_paths, _on_file_changed)
+    await watcher.start()
+    logger.info("SessionWatcher started")
+    yield
+    # 关闭文件监听
+    if watcher:
+        await watcher.stop()
+        logger.info("SessionWatcher stopped")
+
+
+app = FastAPI(title="Session Manager", version="0.1.0", lifespan=lifespan)
+START_TIME = time.time()
 
 db = IndexDB()
 archiver = SessionArchiver(ARCHIVE_DIR, ARCHIVE_MAPPINGS)
 handoff = HandoffController(db)
+ws_manager = WebSocketManager()
+watcher: Optional[SessionWatcher] = None
 
 # 加载/持久化用户自定义 provider 配置
 CONFIG_PATH = DATA_DIR / "providers.json"
@@ -48,6 +81,78 @@ def save_provider_configs(configs: list):
 
 def get_configs() -> list:
     return load_provider_configs()
+
+
+def _on_file_changed(file_path: str):
+    """watchdog 回调：新文件或修改文件 → 解析 → upsert → archive → 广播。"""
+    configs = get_configs()
+    path = Path(file_path)
+    for cfg in configs:
+        if not cfg.get("enabled", True):
+            continue
+        # 检查路径是否属于该 provider 的 scan_paths
+        belongs = False
+        for sp in cfg.get("scan_paths", []):
+            try:
+                if Path(sp).resolve() in path.resolve().parents or Path(sp).resolve() == path.resolve().parent:
+                    belongs = True
+                    break
+            except Exception:
+                pass
+        if not belongs:
+            continue
+
+        adapter = build_adapter(cfg)
+        if not adapter.detect():
+            continue
+        try:
+            sessions = adapter.scan_sessions()
+            for s in sessions:
+                # 检查该 session 是否匹配此文件路径
+                if s.source_path and Path(s.source_path).resolve() == path.resolve():
+                    sid = f"{s.provider_id}::{s.session_id}"
+                    record = SessionRecord(
+                        id=sid, provider_id=s.provider_id, session_id=s.session_id,
+                        title=s.title, summary=s.summary, project_dir=s.project_dir,
+                        status="未标注", created_at=s.created_at,
+                        last_active_at=s.last_active_at, source_path=s.source_path,
+                        raw_meta=json.dumps({"source_path": s.source_path, "title": s.title}, ensure_ascii=False),
+                    )
+                    inserted, _ = db.upsert_sessions([record])
+                    db.sync_projects()
+
+                    # 自动归档
+                    for new_sid in inserted:
+                        if db.is_archived(new_sid):
+                            continue
+                        row = db.get_session(new_sid)
+                        if not row:
+                            continue
+                        try:
+                            messages = adapter.load_transcript(row["session_id"])
+                            archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages])
+                            db.record_archive(new_sid, str(archiver.archive_dir), len(messages))
+                        except Exception:
+                            logger.debug("Auto-archive failed for %s", new_sid, exc_info=True)
+
+                    # WebSocket 广播
+                    for sid_key in (inserted + [sid] if sid not in inserted else inserted):
+                        async def _broadcast():
+                            await ws_manager.broadcast({
+                                "type": "new_session",
+                                "session_id": sid_key,
+                                "title": s.title or s.session_id,
+                                "provider_id": s.provider_id,
+                            })
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(_broadcast())
+                        except RuntimeError:
+                            pass  # 无运行中的事件循环
+                    break  # 已匹配到正确的 adapter，跳出
+        except Exception:
+            logger.debug("Watcher: failed to handle %s", file_path, exc_info=True)
+
 
 @app.get("/api/providers")
 def list_providers():
@@ -824,6 +929,23 @@ static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+@app.get("/api/health")
+def health():
+    db_ok = True
+    db_error = None
+    try:
+        db.list_sessions()
+    except Exception as e:
+        db_ok = False
+        db_error = str(e)
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db": "connected" if db_ok else f"error: {db_error}",
+        "uptime_seconds": int(time.time() - START_TIME),
+        "version": "0.1.0",
+    }
+
+
 @app.get("/")
 def root():
     content = static_dir.joinpath("index.html").read_text(encoding="utf-8")
@@ -843,6 +965,16 @@ def catch_all(path: str):
         "Pragma": "no-cache",
         "Expires": "0",
     })
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws):
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()  # 保持连接，只接收心跳
+    except Exception:
+        ws_manager.disconnect(ws)
+
 
 if __name__ == "__main__":
     import uvicorn

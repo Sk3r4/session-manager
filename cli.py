@@ -112,6 +112,58 @@ def cmd_launch(args):
     print(result["command"])
 
 
+def cmd_ingest(args):
+    """从 JSONL 文件批量导入会话。"""
+    import os.path
+
+    if not os.path.isfile(args.file):
+        print(f"文件不存在: {args.file}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.file, "r", encoding="utf-8", errors="ignore") as f:
+        messages = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"跳过无效 JSON 行: {line[:60]}...", file=sys.stderr)
+                continue
+            role = obj.get("role", obj.get("message", {}).get("role", "unknown"))
+            content = obj.get("content", obj.get("message", {}).get("content", ""))
+            if isinstance(content, list):
+                content = json.dumps(content, ensure_ascii=False)
+            ts = obj.get("timestamp", obj.get("ts"))
+            if isinstance(ts, (int, float)) and ts > 1e12:
+                ts = ts / 1000.0
+            messages.append({"role": role, "content": str(content), "ts": ts or 0})
+
+    if not messages:
+        print("文件中没有有效的消息。", file=sys.stderr)
+        sys.exit(1)
+
+    # 用文件名作为 session_id
+    session_id = os.path.splitext(os.path.basename(args.file))[0]
+
+    body = {
+        "provider": args.provider,
+        "session_id": session_id,
+        "title": args.title,
+        "project_dir": args.project_dir,
+        "messages": messages,
+    }
+
+    print(f"导入 {len(messages)} 条消息 → {args.provider}::{session_id}")
+    result = api("/api/sessions/ingest", method="POST", body=body)
+    print(f"  session_id: {result['session_id']}")
+    print(f"  action: {result['action']}")
+    print(f"  archived: {result['archived']}")
+    if result.get("archived_path"):
+        print(f"  archive: {result['archived_path']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Session Manager CLI")
     sub = parser.add_subparsers(dest="command")
@@ -132,6 +184,12 @@ def main():
     p_launch = sub.add_parser("launch", help="获取会话恢复命令")
     p_launch.add_argument("session_id", help="会话 ID（格式: provider::id）")
 
+    p_ingest = sub.add_parser("ingest", help="从 JSONL 文件导入会话到 Session Manager")
+    p_ingest.add_argument("file", help="JSONL 文件路径（每行一个 JSON 对象，含 role/content/ts）")
+    p_ingest.add_argument("--provider", required=True, help="Provider ID（如 opencode / custom-cli）")
+    p_ingest.add_argument("--title", default=None, help="会话标题（默认取第一条 user 消息）")
+    p_ingest.add_argument("--project-dir", default=None, help="关联的项目目录")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -139,6 +197,7 @@ def main():
 
     {"list": cmd_list, "search": cmd_search, "scan": cmd_scan,
      "stats": cmd_stats, "health": cmd_health, "launch": cmd_launch,
+     "ingest": cmd_ingest,
     }[args.command](args)
 
 

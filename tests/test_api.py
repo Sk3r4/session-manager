@@ -220,6 +220,149 @@ class TestHandoff:
         assert data["found"] is False
 
 
+# ── Ingest ──────────────────────────────────────────────────────────
+
+class TestIngest:
+    def test_ingest_new_session(self, client):
+        """推送新 session → 自动 upsert + archive。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        resp = client.post("/api/sessions/ingest", json={
+            "provider": f"test-{uid}",
+            "session_id": f"ingest-{uid}",
+            "title": "Ingest Test",
+            "project_dir": "/tmp/ingest-test",
+            "messages": [
+                {"role": "user", "content": "Hello world", "ts": 1719000000.0},
+                {"role": "assistant", "content": "Hi!", "ts": 1719000001.0},
+            ],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["action"] == "inserted"
+        assert data["message_count"] == 2
+
+    def test_ingest_duplicate_updates(self, client):
+        """重复推送同一 session → 第一次 inserted，第二次 updated。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        payload = {
+            "provider": f"dup-{uid}",
+            "session_id": f"dup-sid-{uid}",
+            "messages": [{"role": "user", "content": "First push"}],
+        }
+        r1 = client.post("/api/sessions/ingest", json=payload)
+        assert r1.json()["action"] == "inserted"
+        r2 = client.post("/api/sessions/ingest", json=payload)
+        assert r2.json()["action"] == "updated"
+
+    def test_ingest_auto_registers_provider(self, client):
+        """未知 provider 自动创建。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        resp = client.post("/api/sessions/ingest", json={
+            "provider": f"auto-reg-{uid}",
+            "session_id": "sid",
+            "messages": [],
+        })
+        assert resp.status_code == 200
+        providers = client.get("/api/providers").json()
+        ids = [p["id"] for p in providers]
+        assert f"auto-reg-{uid}" in ids
+
+    def test_ingest_creates_archive(self, client):
+        """推送带消息的 session → 自动归档。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        resp = client.post("/api/sessions/ingest", json={
+            "provider": f"arc-{uid}",
+            "session_id": f"arc-sid-{uid}",
+            "messages": [
+                {"role": "user", "content": "Important discussion", "ts": 1719000000.0},
+            ],
+        })
+        data = resp.json()
+        assert data["archived"] is True
+        assert data["archived_path"] is not None
+
+    def test_ingest_empty_messages(self, client):
+        """推送空消息列表 → 仍可创建 session。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        resp = client.post("/api/sessions/ingest", json={
+            "provider": f"empty-{uid}",
+            "session_id": f"empty-{uid}",
+            "messages": [],
+        })
+        assert resp.status_code == 200
+        assert resp.json()["message_count"] == 0
+
+    def test_ingest_list_content(self, client):
+        """推送 list 格式的 content → 展平为字符串。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        resp = client.post("/api/sessions/ingest", json={
+            "provider": f"list-{uid}",
+            "session_id": f"list-{uid}",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Help me"}], "ts": 1719000000.0},
+            ],
+        })
+        assert resp.status_code == 200
+
+
+# ── Register Provider ───────────────────────────────────────────────
+
+class TestRegisterProvider:
+    def test_register_new_provider(self, client):
+        """注册新 provider → action=registered。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        pid = f"reg-{uid}"
+        resp = client.post("/api/providers/register", json={
+            "id": pid, "name": f"Reg CLI {uid}",
+            "resume_command_template": f'reg-{uid} resume "{{session_id}}"',
+        })
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "registered"
+
+        providers = client.get("/api/providers").json()
+        match = [p for p in providers if p["id"] == pid]
+        assert len(match) == 1
+
+    def test_re_register_updates(self, client):
+        """重复注册 → 第一次 registered，第二次 updated。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        pid = f"re-reg-{uid}"
+        r1 = client.post("/api/providers/register", json={
+            "id": pid, "name": "First Name",
+        })
+        assert r1.json()["action"] == "registered"
+        r2 = client.post("/api/providers/register", json={
+            "id": pid, "name": "Updated Name",
+        })
+        assert r2.json()["action"] == "updated"
+
+        providers = client.get("/api/providers").json()
+        match = [p for p in providers if p["id"] == pid]
+        assert match[0]["name"] == "Updated Name"
+
+    def test_register_without_template(self, client):
+        """不提供 resume command → 自动生成默认模板。"""
+        import uuid
+        uid = uuid.uuid4().hex[:8]
+        resp = client.post("/api/providers/register", json={
+            "id": f"auto-{uid}", "name": "Auto",
+        })
+        assert resp.status_code == 200
+
+    def test_register_missing_fields(self, client):
+        """缺少必填字段 → 422。"""
+        resp = client.post("/api/providers/register", json={"id": "no-name"})
+        assert resp.status_code == 422
+
+
 # ── Error Handling ──────────────────────────────────────────────────
 
 class TestErrorHandling:

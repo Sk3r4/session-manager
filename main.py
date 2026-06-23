@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from config import DEFAULT_PROVIDER_CONFIGS, STATUS_OPTIONS, DATA_DIR, ARCHIVE_DIR, ARCHIVE_MAPPINGS, PATTERNS_DIR
 from storage.index import IndexDB, SessionRecord
 from adapters import build_adapter
+from adapters.base import Message
 from exporter import export_markdown, export_pdf, _safe_filename
 from archiver import SessionArchiver
 from handoff import HandoffController
@@ -170,6 +171,45 @@ def list_providers():
         })
     return result
 
+
+class RegisterProviderReq(BaseModel):
+    id: str
+    name: str
+    resume_command_template: Optional[str] = None
+    scan_paths: Optional[List[str]] = None
+
+
+@app.post("/api/providers/register")
+def register_provider(req: RegisterProviderReq):
+    """动态注册新 CLI 工具：不需要写 adapter 代码即可接入。
+
+    注册后立即可用：出现在 provider 列表、支持 launch/copy 命令、
+    可通过 /api/sessions/ingest 推送数据。
+    """
+    configs = load_provider_configs()
+    existing = next((c for c in configs if c["id"] == req.id), None)
+    if existing:
+        existing["name"] = req.name
+        if req.resume_command_template:
+            existing["resume_command_template"] = req.resume_command_template
+        if req.scan_paths is not None:
+            existing["scan_paths"] = req.scan_paths
+        action = "updated"
+    else:
+        configs.append({
+            "id": req.id,
+            "name": req.name,
+            "enabled": True,
+            "adapter_type": "generic",
+            "scan_paths": req.scan_paths or [],
+            "file_patterns": ["*.jsonl"],
+            "resume_command_template": req.resume_command_template or f'{req.id} resume "{{session_id}}"',
+        })
+        action = "registered"
+    save_provider_configs(configs)
+    return {"action": action, "provider_id": req.id}
+
+
 @app.post("/api/providers/{provider_id}/scan")
 def scan_provider(provider_id: str):
     configs = get_configs()
@@ -243,6 +283,91 @@ def scan_all():
             results.append(res)
     db.sync_projects()
     return results
+
+
+class IngestReq(BaseModel):
+    provider: str
+    session_id: str
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    project_dir: Optional[str] = None
+    messages: List[dict] = []
+    resume_command: Optional[str] = None
+
+
+@app.post("/api/sessions/ingest")
+def ingest_session(req: IngestReq):
+    """统一写入入口：任意 CLI 工具直接推送 session 数据。
+
+    接收后自动：upsert SQLite → 归档 Markdown → 返回结果。
+    不依赖 adapter，不依赖文件系统扫描。
+    """
+    sid = f"{req.provider}::{req.session_id}"
+    now = time.time()
+
+    # 确保 provider 已注册（不存在则自动创建）
+    configs = load_provider_configs()
+    existing = next((c for c in configs if c["id"] == req.provider), None)
+    if not existing:
+        resume_tpl = req.resume_command or f'{req.provider} resume "{{session_id}}"'
+        configs.append({
+            "id": req.provider,
+            "name": req.provider,
+            "enabled": True,
+            "adapter_type": "generic",
+            "scan_paths": [],
+            "file_patterns": ["*.jsonl"],
+            "resume_command_template": resume_tpl,
+        })
+        save_provider_configs(configs)
+
+    # 提取 summary（取第一条 user 消息的前 200 字符）
+    summary = req.summary
+    if not summary:
+        for m in req.messages:
+            if m.get("role") == "user":
+                text = m.get("content", "")
+                if isinstance(text, list):
+                    text = " ".join(
+                        item.get("text", "") if isinstance(item, dict) else str(item)
+                        for item in text
+                    )
+                summary = text[:200] + ("..." if len(text) > 200 else "")
+                break
+
+    record = SessionRecord(
+        id=sid, provider_id=req.provider, session_id=req.session_id,
+        title=req.title, summary=summary, project_dir=req.project_dir,
+        status="未标注",
+        created_at=now, last_active_at=now,
+        source_path=f"ingest://{req.provider}/{req.session_id}",
+        raw_meta=json.dumps({"ingested": True, "title": req.title}, ensure_ascii=False),
+    )
+    inserted, updated = db.upsert_sessions([record])
+    db.sync_projects()
+
+    # 归档 Markdown
+    archived_path = None
+    row = db.get_session(sid)
+    if row:
+        try:
+            msgs = [Message(role=m.get("role", "unknown"),
+                           content=m.get("content", "") if isinstance(m.get("content"), str) else json.dumps(m.get("content", ""), ensure_ascii=False),
+                           ts=m.get("ts")) for m in req.messages]
+            path = archiver.archive(row, [{"role": m.role, "content": m.content, "ts": m.ts} for m in msgs])
+            db.record_archive(sid, str(path), len(req.messages))
+            archived_path = str(path)
+        except Exception:
+            logger.debug("Ingest archive failed for %s", sid, exc_info=True)
+
+    return {
+        "session_id": sid,
+        "action": "inserted" if inserted else "updated",
+        "archived": archived_path is not None,
+        "archived_path": archived_path,
+        "message_count": len(req.messages),
+    }
+
 
 @app.get("/api/sessions")
 def list_sessions(

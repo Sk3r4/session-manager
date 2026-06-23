@@ -90,6 +90,45 @@ def archive_pattern(name: str, ptype: str) -> Tuple[bool, str]:
     return True, str(dest)
 
 
+def title_similarity(a: str, b: str) -> float:
+    """计算两个标题的相似度（0.0 ~ 1.0）。
+
+    使用简单的词集合 Jaccard 相似度，适配中英文混合标题。
+    """
+    import unicodedata
+    # 归一化：小写 + 全角转半角
+    a_norm = unicodedata.normalize("NFKC", a.lower().strip())
+    b_norm = unicodedata.normalize("NFKC", b.lower().strip())
+    if a_norm == b_norm:
+        return 1.0
+
+    # 按词切分（中文字符单独成词，英文按空格）
+    def tokenize(s):
+        tokens = []
+        word = ""
+        for ch in s:
+            if "一" <= ch <= "鿿" or "぀" <= ch <= "ヿ":
+                if word:
+                    tokens.append(word)
+                    word = ""
+                tokens.append(ch)
+            elif ch.isalnum():
+                word += ch
+            else:
+                if word:
+                    tokens.append(word)
+                    word = ""
+        if word:
+            tokens.append(word)
+        return set(tokens)
+
+    a_set = tokenize(a_norm)
+    b_set = tokenize(b_norm)
+    if not a_set or not b_set:
+        return 0.0
+    return len(a_set & b_set) / len(a_set | b_set)
+
+
 def restore_pattern(name: str) -> Optional[Path]:
     """从 .archive/ 恢复 Pattern。"""
     archive_dir = PATTERNS_DIR / ".archive"

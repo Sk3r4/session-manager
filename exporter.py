@@ -82,8 +82,8 @@ def export_pdf(session: dict, messages: List[Dict[str, Any]]) -> bytes:
 
     # Windows 中文字体
     font_path = r"C:\Windows\Fonts\msyh.ttc"
-    pdf.add_font("MSYH", "", font_path, uni=True)
-    pdf.add_font("MSYH", "B", font_path, uni=True)
+    pdf.add_font("MSYH", "", font_path)
+    pdf.add_font("MSYH", "B", font_path)
 
     pdf.add_page()
 

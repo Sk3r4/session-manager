@@ -776,6 +776,8 @@ class ReviewReq(BaseModel):
 def review_sessions(req: ReviewReq):
     """选择一个或多个 session 执行 LLM Review，提取 Pattern。"""
     from reviewer import run_review
+    from patterns import title_similarity
+
     configs = get_configs()
     all_results = []
     for sid in req.session_ids:
@@ -794,14 +796,39 @@ def review_sessions(req: ReviewReq):
             patterns = run_review(sid, row["provider_id"], msgs,
                                   project_dir=row.get("project_dir") or "")
             for p in patterns:
-                source_json = json.dumps(p.get("source_sessions", []), ensure_ascii=False)
-                tags_json = json.dumps(p.get("tags", []), ensure_ascii=False)
-                db.upsert_pattern(
-                    name=p["name"], ptype=p["type"], title=p["title"],
-                    file_path=p["file_path"], project=row.get("project_dir") or "",
-                    tags=tags_json, source_sessions=source_json,
-                    status="draft",
-                )
+                # ── 去重：FTS5 搜索已有 Pattern，相似度 > 80% 则合并 ──
+                existing = db.list_patterns(search=p["name"].split("-")[0])
+                merged = False
+                for ex in existing:
+                    if title_similarity(p["title"], ex["title"]) > 0.8:
+                        # 追加 source_session 到已有 Pattern
+                        try:
+                            old_sessions = json.loads(ex.get("source_sessions", "[]"))
+                        except Exception:
+                            old_sessions = []
+                        new_sessions = p.get("source_sessions", [])
+                        combined = sorted(set(old_sessions + new_sessions))
+                        db.upsert_pattern(
+                            name=ex["name"], ptype=ex["type"], title=ex["title"],
+                            file_path=ex["file_path"], project=ex.get("project", ""),
+                            tags=ex.get("tags", "[]"),
+                            source_sessions=json.dumps(combined, ensure_ascii=False),
+                            status=ex.get("status", "verified"),
+                        )
+                        db.bump_pattern_use(ex["name"])
+                        p["merged_into"] = ex["name"]
+                        merged = True
+                        break
+
+                if not merged:
+                    source_json = json.dumps(p.get("source_sessions", []), ensure_ascii=False)
+                    tags_json = json.dumps(p.get("tags", []), ensure_ascii=False)
+                    db.upsert_pattern(
+                        name=p["name"], ptype=p["type"], title=p["title"],
+                        file_path=p["file_path"], project=row.get("project_dir") or "",
+                        tags=tags_json, source_sessions=source_json,
+                        status="draft",
+                    )
             all_results.append({
                 "session_id": sid,
                 "patterns": patterns,

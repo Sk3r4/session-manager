@@ -56,4 +56,4 @@ Write-Host "  URL: http://127.0.0.1:$Port" -ForegroundColor Green
 Write-Host "  Press Ctrl+C to stop" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Cyan
 
-& $PythonExe -m uvicorn main:app --host 127.0.0.1 --port $Port --reload --log-file data/server.log
+& $PythonExe -m uvicorn main:app --host 127.0.0.1 --port $Port --reload --log-config log_config.yaml

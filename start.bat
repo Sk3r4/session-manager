@@ -65,5 +65,5 @@ echo   URL: http://127.0.0.1:%PORT%
 echo   Press Ctrl+C to stop
 echo ========================================
 
-%PYTHON_EXE% -m uvicorn main:app --host 127.0.0.1 --port %PORT% --reload --log-file data/server.log
+%PYTHON_EXE% -m uvicorn main:app --host 127.0.0.1 --port %PORT% --reload --log-config log_config.yaml
 pause

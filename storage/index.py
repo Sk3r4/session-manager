@@ -31,6 +31,9 @@ class IndexDB:
 
     def _ensure_tables(self):
         with self._conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
@@ -92,6 +95,118 @@ class IndexDB:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pinned ON sessions(pinned)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted ON sessions(deleted)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_project_dir ON sessions(project_dir)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS handoff_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_dir TEXT NOT NULL,
+                    session_id TEXT,
+                    source TEXT NOT NULL DEFAULT 'stop_hook',
+                    summary_text TEXT NOT NULL,
+                    key_findings TEXT,
+                    current_phase TEXT,
+                    next_action TEXT,
+                    volatility_tags TEXT,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_handoff_project ON handoff_entries(project_dir)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_handoff_created ON handoff_entries(created_at)")
+
+            # patterns_idx — 轻量索引，本体在 data/patterns/*.md
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS patterns_idx (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    type TEXT NOT NULL DEFAULT 'workflow',
+                    title TEXT NOT NULL,
+                    category TEXT,
+                    project TEXT,
+                    tags TEXT,
+                    source_sessions TEXT,
+                    file_path TEXT NOT NULL,
+                    status TEXT DEFAULT 'draft',
+                    use_count INTEGER DEFAULT 0,
+                    created_at REAL,
+                    updated_at REAL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_type ON patterns_idx(type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_status ON patterns_idx(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_project ON patterns_idx(project)")
+
+            # FTS5 — sessions 搜索
+            try:
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts
+                    USING fts5(id, title, summary, project_dir,
+                               content=sessions, content_rowid='rowid', tokenize='unicode61')
+                """)
+            except sqlite3.OperationalError:
+                pass
+
+            # FTS5 — patterns 搜索
+            try:
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts
+                    USING fts5(name, title, tags, content=patterns_idx, content_rowid='rowid', tokenize='unicode61')
+                """)
+            except sqlite3.OperationalError:
+                pass
+
+            # FTS5 同步触发器 — sessions
+            try:
+                conn.executescript("""
+                    DROP TRIGGER IF EXISTS sessions_fts_insert;
+                    CREATE TRIGGER sessions_fts_insert AFTER INSERT ON sessions BEGIN
+                        INSERT INTO sessions_fts(rowid, title, summary, project_dir)
+                        VALUES (new.rowid, new.title, new.summary, new.project_dir);
+                    END;
+                    DROP TRIGGER IF EXISTS sessions_fts_delete;
+                    CREATE TRIGGER sessions_fts_delete AFTER DELETE ON sessions BEGIN
+                        INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, project_dir)
+                        VALUES ('delete', old.rowid, old.title, old.summary, old.project_dir);
+                    END;
+                    DROP TRIGGER IF EXISTS sessions_fts_update;
+                    CREATE TRIGGER sessions_fts_update AFTER UPDATE ON sessions BEGIN
+                        INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, project_dir)
+                        VALUES ('delete', old.rowid, old.title, old.summary, old.project_dir);
+                        INSERT INTO sessions_fts(rowid, title, summary, project_dir)
+                        VALUES (new.rowid, new.title, new.summary, new.project_dir);
+                    END;
+                """)
+            except sqlite3.OperationalError:
+                pass
+
+            # 回填已有 sessions 到 FTS5 索引
+            conn.execute("""
+                INSERT OR IGNORE INTO sessions_fts(rowid, title, summary, project_dir)
+                SELECT s.rowid, s.title, s.summary, s.project_dir
+                FROM sessions s WHERE s.deleted = 0
+            """)
+
+            # FTS5 同步触发器 — patterns
+            try:
+                conn.executescript("""
+                    DROP TRIGGER IF EXISTS patterns_fts_insert;
+                    CREATE TRIGGER patterns_fts_insert AFTER INSERT ON patterns_idx BEGIN
+                        INSERT INTO patterns_fts(rowid, name, title, tags)
+                        VALUES (new.rowid, new.name, new.title, new.tags);
+                    END;
+                    DROP TRIGGER IF EXISTS patterns_fts_delete;
+                    CREATE TRIGGER patterns_fts_delete AFTER DELETE ON patterns_idx BEGIN
+                        INSERT INTO patterns_fts(patterns_fts, rowid, name, title, tags)
+                        VALUES ('delete', old.rowid, old.name, old.title, old.tags);
+                    END;
+                    DROP TRIGGER IF EXISTS patterns_fts_update;
+                    CREATE TRIGGER patterns_fts_update AFTER UPDATE ON patterns_idx BEGIN
+                        INSERT INTO patterns_fts(patterns_fts, rowid, name, title, tags)
+                        VALUES ('delete', old.rowid, old.name, old.title, old.tags);
+                        INSERT INTO patterns_fts(rowid, name, title, tags)
+                        VALUES (new.rowid, new.name, new.title, new.tags);
+                    END;
+                """)
+            except sqlite3.OperationalError:
+                pass
 
     def upsert_sessions(self, records: List[SessionRecord]) -> tuple:
         """返回 (inserted_ids, updated_ids)"""
@@ -388,6 +503,48 @@ class IndexDB:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
+    def insert_handoff(self, project_dir: str, summary_text: str, session_id: Optional[str] = None,
+                       key_findings: Optional[str] = None, current_phase: Optional[str] = None,
+                       next_action: Optional[str] = None, volatility_tags: Optional[str] = None,
+                       source: str = "stop_hook") -> int:
+        with self._conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO handoff_entries (project_dir, session_id, source, summary_text, key_findings,
+                    current_phase, next_action, volatility_tags, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (project_dir, session_id, source, summary_text, key_findings,
+                  current_phase, next_action, volatility_tags, datetime.now().timestamp()))
+            return cur.lastrowid
+
+    def get_handoff_context(self, project_dir: str, limit: int = 5) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT * FROM handoff_entries
+                WHERE project_dir = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (project_dir, limit)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_latest_handoff(self, project_dir: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("""
+                SELECT * FROM handoff_entries
+                WHERE project_dir = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (project_dir,)).fetchone()
+            return dict(row) if row else None
+
+    def list_handoff_projects(self) -> List[str]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT project_dir FROM handoff_entries ORDER BY project_dir
+            """).fetchall()
+            return [r[0] for r in rows]
+
     def get_providers_summary(self) -> List[Dict[str, Any]]:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
@@ -397,4 +554,116 @@ class IndexDB:
                        SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END) as pinned
                 FROM sessions WHERE deleted = 0 GROUP BY provider_id
             """).fetchall()
+            return [dict(r) for r in rows]
+
+    # -- FTS5 unified search ------------------------------------------------
+
+    def fts5_search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Unified FTS5 search across sessions + patterns. Falls back to LIKE."""
+        results = []
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT s.*, rank FROM sessions_fts f
+                    JOIN sessions s ON s.rowid = f.rowid
+                    WHERE sessions_fts MATCH ? AND s.deleted = 0
+                    ORDER BY rank LIMIT ?
+                """, (query, limit)).fetchall()
+                for r in rows:
+                    d = dict(r)
+                    d["result_type"] = "session"
+                    d["display_name"] = d.get("title") or d.get("session_id") or "untitled"
+                    results.append(d)
+        except Exception:
+            pass
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT p.*, rank FROM patterns_fts f
+                    JOIN patterns_idx p ON p.rowid = f.rowid
+                    WHERE patterns_fts MATCH ?
+                    ORDER BY rank LIMIT ?
+                """, (query, limit)).fetchall()
+                for r in rows:
+                    d = dict(r)
+                    d["result_type"] = "pattern"
+                    d["display_name"] = d.get("title") or d.get("name")
+                    results.append(d)
+        except Exception:
+            pass
+        return sorted(results, key=lambda x: x.get("updated_at") or x.get("last_active_at") or 0, reverse=True)[:limit]
+
+    # -- Pattern CRUD --------------------------------------------------------
+
+    def upsert_pattern(self, name: str, ptype: str, title: str, file_path: str,
+                       category: str = "", project: str = "",
+                       tags: str = "", source_sessions: str = "",
+                       status: str = "draft") -> int:
+        now = datetime.now().timestamp()
+        with self._conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO patterns_idx (name, type, title, category, project, tags,
+                    source_sessions, file_path, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    type=excluded.type, title=excluded.title, updated_at=excluded.updated_at,
+                    file_path=excluded.file_path, tags=excluded.tags,
+                    source_sessions=excluded.source_sessions
+            """, (name, ptype, title, category, project, tags,
+                  source_sessions, file_path, status, now, now))
+            return cur.lastrowid
+
+    def list_patterns(self, ptype: Optional[str] = None, status: Optional[str] = None,
+                      project: Optional[str] = None, search: Optional[str] = None) -> List[Dict]:
+        sql = "SELECT * FROM patterns_idx WHERE 1=1"
+        params = []
+        if ptype:
+            sql += " AND type = ?"; params.append(ptype)
+        if status:
+            sql += " AND status = ?"; params.append(status)
+        if project:
+            sql += " AND project = ?"; params.append(project)
+        if search:
+            sql += " AND (name LIKE ? OR title LIKE ?)"
+            params.extend([f"%{search}%"] * 2)
+        sql += " ORDER BY updated_at DESC, created_at DESC"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def get_pattern(self, name: str) -> Optional[Dict]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM patterns_idx WHERE name = ?", (name,)).fetchone()
+            return dict(row) if row else None
+
+    def update_pattern_status(self, name: str, status: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE patterns_idx SET status = ?, updated_at = ? WHERE name = ?",
+                         (status, datetime.now().timestamp(), name))
+
+    def bump_pattern_use(self, name: str):
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE patterns_idx SET use_count = use_count + 1, updated_at = ?
+                WHERE name = ?
+            """, (datetime.now().timestamp(), name))
+
+    def delete_pattern(self, name: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM patterns_idx WHERE name = ?", (name,))
+            return cur.rowcount > 0
+
+    def list_patterns_by_names(self, names: List[str]) -> List[Dict]:
+        if not names:
+            return []
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" * len(names))
+            rows = conn.execute(
+                f"SELECT * FROM patterns_idx WHERE name IN ({placeholders})",
+                names
+            ).fetchall()
             return [dict(r) for r in rows]

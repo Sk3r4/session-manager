@@ -1,6 +1,7 @@
-﻿from abc import ABC, abstractmethod
+﻿import time
+from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 @dataclass
@@ -22,10 +23,24 @@ class SessionMeta:
     source_path: Optional[str] = None
 
 class ProviderAdapter(ABC):
+    # 缓存 TTL（秒），30s 避免高频扫描磁盘
+    CACHE_TTL = 30.0
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.provider_id = config["id"]
         self.provider_name = config["name"]
+        self._files_cache: Any = None
+        self._files_cache_at: float = 0.0
+
+    def _cached_find_files(self, finder):
+        """通用缓存包装：finder() 结果缓存 CACHE_TTL 秒。"""
+        now = time.time()
+        if self._files_cache is not None and (now - self._files_cache_at) < self.CACHE_TTL:
+            return self._files_cache
+        self._files_cache = finder()
+        self._files_cache_at = now
+        return self._files_cache
 
     @abstractmethod
     def detect(self) -> bool:

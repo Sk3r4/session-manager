@@ -1,10 +1,13 @@
 ﻿import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from adapters.base import ProviderAdapter, SessionMeta, Message
+
+logger = logging.getLogger(__name__)
 
 class CodexAdapter(ProviderAdapter):
     """Codex CLI 适配器：解析 .codex/sessions/YYYY/MM/DD/rollout-*.jsonl 格式。"""
@@ -16,6 +19,9 @@ class CodexAdapter(ProviderAdapter):
         return False
 
     def _find_files(self) -> List[Path]:
+        return self._cached_find_files(self._scan_files)
+
+    def _scan_files(self) -> List[Path]:
         files = []
         for sp in self.config.get("scan_paths", []):
             base = Path(sp)
@@ -87,7 +93,7 @@ class CodexAdapter(ProviderAdapter):
                     if project_dir and summary:
                         break
         except Exception:
-            pass
+            logger.debug("Failed to parse session file %s: %s", path.name, exc_info=True)
 
         stat = path.stat()
         if not created_at:
@@ -156,7 +162,7 @@ class CodexAdapter(ProviderAdapter):
                             pass
                     messages.append(Message(role=str(role), content=content, ts=ts, raw=payload))
         except Exception:
-            pass
+            logger.debug("Failed to load messages from %s: %s", path.name, exc_info=True)
         return messages
 
     def get_project_dir(self, session_id: str) -> Optional[str]:

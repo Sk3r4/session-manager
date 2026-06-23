@@ -1,62 +1,13 @@
 ﻿import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from datetime import datetime
 
 from adapters.base import ProviderAdapter, SessionMeta, Message
+from adapters.utils import parse_ts, extract_text_from_content
 
-
-def _parse_ts(value) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        if value > 1e12:
-            return value / 1000.0
-        return float(value)
-    if isinstance(value, str):
-        try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return dt.timestamp()
-        except Exception:
-            pass
-        try:
-            v = float(value)
-            return _parse_ts(v)
-        except Exception:
-            pass
-    return None
-
-
-def _extract_text_from_content(content) -> str:
-    """提取 Kimi content 中的文本。支持字符串和列表格式。"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for c in content:
-            if isinstance(c, dict):
-                t = c.get("type", "")
-                if t == "text":
-                    parts.append(c.get("text", ""))
-                elif t == "think":
-                    parts.append(c.get("think", ""))
-                elif t == "thinking":
-                    parts.append(f"[思考] {c.get('thinking', '')}")
-                elif t == "tool_use":
-                    parts.append(f"[工具调用: {c.get('name', '')}] {json.dumps(c.get('input', {}), ensure_ascii=False)}")
-                elif t == "tool_result":
-                    parts.append(f"[工具结果] {c.get('content', '')}")
-                else:
-                    # 兜底：取所有字符串值
-                    for k, v in c.items():
-                        if isinstance(v, str) and v.strip() and k not in ("type", "encrypted"):
-                            parts.append(v)
-                            break
-            elif isinstance(c, str):
-                parts.append(c)
-        return "\n".join(parts)
-    return ""
+logger = logging.getLogger(__name__)
 
 
 def _read_project_dir_from_kimi_json(session_id: str) -> Optional[str]:
@@ -74,6 +25,7 @@ def _read_project_dir_from_kimi_json(session_id: str) -> Optional[str]:
                     return path
         return None
     except Exception:
+        logger.debug("Failed to read kimi.json: %s", exc_info=True)
         return None
 
 
@@ -122,6 +74,9 @@ class KimiCodeAdapter(ProviderAdapter):
         return False
 
     def _find_sessions(self) -> List[tuple]:
+        return self._cached_find_files(self._scan_sessions)
+
+    def _scan_sessions(self) -> List[tuple]:
         """返回 (session_id, context_jsonl_path, session_dir) 列表。"""
         results = []
         for sp in self.config.get("scan_paths", []):
@@ -180,12 +135,12 @@ class KimiCodeAdapter(ProviderAdapter):
                     role = obj.get("role", "")
                     if role == "user":
                         content = obj.get("content", "")
-                        text = _extract_text_from_content(content)
+                        text = extract_text_from_content(content)
                         if text.strip():
                             summary = text[:200] + "..." if len(text) > 200 else text
                         break
         except Exception:
-            pass
+            logger.debug("Failed to parse session file %s: %s", path.name, exc_info=True)
 
         stat = path.stat()
         created_at = stat.st_ctime
@@ -229,14 +184,14 @@ class KimiCodeAdapter(ProviderAdapter):
                         continue
                     role = obj.get("role", "unknown")
                     content = obj.get("content", "")
-                    text = _extract_text_from_content(content)
-                    ts = _parse_ts(obj.get("timestamp") or obj.get("ts") or obj.get("created_at"))
+                    text = extract_text_from_content(content)
+                    ts = parse_ts(obj.get("timestamp") or obj.get("ts") or obj.get("created_at"))
                     # 跳过内部元数据行，除非在完整模式下
                     if role.startswith("_"):
                         continue
                     messages.append(Message(role=str(role), content=text, ts=ts, raw=obj))
         except Exception:
-            pass
+            logger.debug("Failed to load messages from %s: %s", path.name, exc_info=True)
         return messages
 
     def get_project_dir(self, session_id: str) -> Optional[str]:

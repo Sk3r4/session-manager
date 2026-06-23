@@ -1,5 +1,7 @@
-﻿import io
+﻿import base64
+import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -16,16 +18,20 @@ from urllib.parse import quote
 from fastapi.responses import Response, FileResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
-from config import DEFAULT_PROVIDER_CONFIGS, STATUS_OPTIONS, DATA_DIR, ARCHIVE_DIR, ARCHIVE_MAPPINGS
+from config import DEFAULT_PROVIDER_CONFIGS, STATUS_OPTIONS, DATA_DIR, ARCHIVE_DIR, ARCHIVE_MAPPINGS, PATTERNS_DIR
 from storage.index import IndexDB, SessionRecord
 from adapters import build_adapter
 from exporter import export_markdown, export_pdf, _safe_filename
 from archiver import SessionArchiver
+from handoff import HandoffController
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Session Manager", version="0.1.0")
 
 db = IndexDB()
 archiver = SessionArchiver(ARCHIVE_DIR, ARCHIVE_MAPPINGS)
+handoff = HandoffController(db)
 
 # 加载/持久化用户自定义 provider 配置
 CONFIG_PATH = DATA_DIR / "providers.json"
@@ -109,7 +115,7 @@ def scan_provider(provider_id: str):
                 db.record_archive(sid, str(path), len(messages))
                 archived_count += 1
             except Exception as e:
-                print(f"Auto-archive failed for {sid}: {e}")
+                logger.warning("Auto-archive failed for %s: %s", sid, e)
 
         db.log_scan(provider_id, len(records))
         return {"provider_id": provider_id, "found": len(records), "archived": archived_count}
@@ -297,11 +303,7 @@ def copy_command(session_id: str):
         return JSONResponse(status_code=404, content={"error": "Provider config not found"})
     adapter = build_adapter(cfg)
     raw_sid = row["session_id"]
-    project_dir = row.get("project_dir") or adapter.get_project_dir(raw_sid)
-    if project_dir and Path(project_dir).exists():
-        cmd = f'kimi -r "{raw_sid}"'
-    else:
-        cmd = adapter.get_resume_command(raw_sid)
+    cmd = adapter.get_resume_command(raw_sid)
     return {"command": cmd}
 
 @app.post("/api/sessions/{session_id}/launch")
@@ -315,20 +317,16 @@ def launch_session(session_id: str):
         return JSONResponse(status_code=404, content={"error": "Provider config not found"})
     adapter = build_adapter(cfg)
     raw_sid = row["session_id"]
+    cmd = adapter.get_resume_command(raw_sid)
     project_dir = row.get("project_dir") or adapter.get_project_dir(raw_sid)
-
-    # 优先使用数据库中的 project_dir 生成带 ID 的 resume 命令
-    # 只有当 project_dir 确实未知时才降级为交互式选择
-    if project_dir and Path(project_dir).exists():
-        cmd = f'kimi -r "{raw_sid}"'
-    else:
-        cmd = adapter.get_resume_command(raw_sid)
 
     # 构建 PowerShell 命令
     # 先设置 UTF-8 编码避免中文乱码/崩溃，再执行 resume 命令
     # 使用 subprocess.Popen 的 cwd 参数设置工作目录，避免路径中的特殊字符（如 [] " ' 空格等）
     # 在命令字符串中被 PowerShell 通配符或引号解析机制误处理
-    ps_cmd = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}'
+    # 使用 -EncodedCommand + Base64 防止 session_id 中的特殊字符注入
+    ps_script = f'chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}'
+    encoded_cmd = base64.b64encode(ps_script.encode('utf-16-le')).decode('ascii')
 
     popen_kwargs = {}
     if project_dir and Path(project_dir).exists():
@@ -337,11 +335,11 @@ def launch_session(session_id: str):
     try:
         # 在新 PowerShell 窗口中执行
         subprocess.Popen(
-            ["powershell", "-NoExit", "-Command", ps_cmd],
+            ["powershell", "-NoExit", "-EncodedCommand", encoded_cmd],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             **popen_kwargs,
         )
-        return {"launched": True, "command": ps_cmd, "cwd": popen_kwargs.get("cwd")}
+        return {"launched": True, "command": cmd, "cwd": popen_kwargs.get("cwd")}
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -411,6 +409,82 @@ def unpin_session(session_id: str):
     if not row:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
     return row
+
+# ═══════════════════════════════════════════════════════════════
+# Handoff API — 跨会话上下文保持
+# ═══════════════════════════════════════════════════════════════
+
+class ArchiveHandoffReq(BaseModel):
+    project_dir: str
+    summary_text: str
+    session_id: Optional[str] = None
+    source: str = "stop_hook"
+    metadata: Optional[dict] = None
+
+@app.post("/api/handoff/archive")
+def handoff_archive(req: ArchiveHandoffReq):
+    """归档 AI 回复末尾的 handoff 摘要，或 PreCompact 时的完整 transcript。
+
+    Stop hook 调用此端点存储 AI 的带标志位摘要。
+    PreCompact hook 调用此端点存储完整 transcript 快照。
+    """
+    try:
+        result = handoff.archive_summary(
+            project_dir=req.project_dir,
+            summary_text=req.summary_text,
+            session_id=req.session_id,
+            source=req.source,
+            metadata=req.metadata,
+        )
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+class ArchiveTranscriptReq(BaseModel):
+    project_dir: str
+    transcript_path: str
+    session_id: Optional[str] = None
+
+@app.post("/api/handoff/archive-transcript")
+def handoff_archive_transcript(req: ArchiveTranscriptReq):
+    """PreCompact hook 专用：直接传 transcript 文件路径，由服务端读取并归档。"""
+    try:
+        result = handoff.archive_full_transcript(
+            project_dir=req.project_dir,
+            transcript_path=req.transcript_path,
+            session_id=req.session_id,
+        )
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/handoff/context")
+def handoff_context(project_dir: str = Query(...), limit: int = Query(5)):
+    """获取项目的最近 handoff 摘要，返回 Markdown 格式供 AI 直接阅读。
+
+    AI 在新会话或 compaction 后调用此端点恢复上下文。
+    返回 compact markdown，可直接作为上下文注入。
+    """
+    try:
+        result = handoff.get_context(project_dir, limit=limit)
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/handoff/latest")
+def handoff_latest(project_dir: str = Query(...)):
+    """获取最近一条 handoff 摘要。轻量级查询，适合频繁调用。"""
+    try:
+        result = handoff.get_latest(project_dir)
+        if not result:
+            return {"project_dir": project_dir, "found": False, "message": "No handoff entries yet"}
+        return {"project_dir": project_dir, "found": True, **result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 @app.get("/api/daily-stats")
 def daily_stats():
@@ -585,6 +659,165 @@ def export_project(project_id: str):
 @app.get("/api/stats")
 def stats():
     return db.get_providers_summary()
+
+# ═══════════════════════════════════════════════════════════════
+# Session Review API — 人为触发复盘
+# ═══════════════════════════════════════════════════════════════
+
+class ReviewReq(BaseModel):
+    session_ids: List[str]
+
+@app.post("/api/sessions/review")
+def review_sessions(req: ReviewReq):
+    """选择一个或多个 session 执行 LLM Review，提取 Pattern。"""
+    from reviewer import run_review
+    configs = get_configs()
+    all_results = []
+    for sid in req.session_ids:
+        row = db.get_session(sid)
+        if not row:
+            all_results.append({"session_id": sid, "error": "Session not found", "patterns": []})
+            continue
+        cfg = next((c for c in configs if c["id"] == row["provider_id"]), None)
+        if not cfg:
+            all_results.append({"session_id": sid, "error": "Provider not found", "patterns": []})
+            continue
+        try:
+            adapter = build_adapter(cfg)
+            messages = adapter.load_transcript(row["session_id"])
+            msgs = [{"role": m.role, "content": m.content, "ts": m.ts} for m in messages]
+            patterns = run_review(sid, row["provider_id"], msgs,
+                                  project_dir=row.get("project_dir") or "")
+            for p in patterns:
+                source_json = json.dumps(p.get("source_sessions", []), ensure_ascii=False)
+                tags_json = json.dumps(p.get("tags", []), ensure_ascii=False)
+                db.upsert_pattern(
+                    name=p["name"], ptype=p["type"], title=p["title"],
+                    file_path=p["file_path"], project=row.get("project_dir") or "",
+                    tags=tags_json, source_sessions=source_json,
+                    status="draft",
+                )
+            all_results.append({
+                "session_id": sid,
+                "patterns": patterns,
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            all_results.append({"session_id": sid, "error": str(e), "patterns": []})
+    return {"results": all_results}
+
+# ═══════════════════════════════════════════════════════════════
+# Patterns API — CRUD + 聚合
+# ═══════════════════════════════════════════════════════════════
+
+class UpdatePatternReq(BaseModel):
+    status: Optional[str] = None
+
+class ConsolidateReq(BaseModel):
+    prefix: str
+    umbrella_name: str
+
+@app.get("/api/patterns")
+def list_patterns(
+    type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    project: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+):
+    return db.list_patterns(ptype=type, status=status, project=project, search=search)
+
+@app.get("/api/patterns/consolidate")
+def find_clusters():
+    """扫描现有 Pattern，发现可合并的前缀聚类。"""
+    from patterns import find_prefix_clusters
+    return find_prefix_clusters(db)
+
+@app.post("/api/patterns/consolidate/apply")
+def apply_consolidation(req: ConsolidateReq):
+    """执行合并：将同一前缀的 Pattern 合并为 Umbrella Pattern。"""
+    from patterns import consolidate_cluster
+    members = consolidate_cluster(db, req.prefix, req.umbrella_name)
+    return {"consolidated": True, "umbrella": req.umbrella_name, "members": members}
+
+@app.get("/api/patterns/{name}")
+def get_pattern(name: str):
+    row = db.get_pattern(name)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Pattern not found"})
+    from patterns import read_pattern_file
+    fm_data = read_pattern_file(name, row["type"])
+    if fm_data:
+        row["body"] = fm_data.get("body", "")
+        row["frontmatter"] = fm_data.get("frontmatter", {})
+    db.bump_pattern_use(name)
+    return row
+
+@app.put("/api/patterns/{name}")
+def update_pattern(name: str, req: UpdatePatternReq):
+    row = db.get_pattern(name)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Pattern not found"})
+    if req.status is not None:
+        db.update_pattern_status(name, req.status)
+    return db.get_pattern(name)
+
+@app.delete("/api/patterns/{name}")
+def delete_pattern(name: str):
+    row = db.get_pattern(name)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Pattern not found"})
+    from patterns import archive_pattern
+    archive_pattern(name, row["type"])
+    db.delete_pattern(name)
+    return {"deleted": True, "name": name}
+
+@app.post("/api/patterns/{name}/restore")
+def restore_pattern(name: str):
+    from patterns import restore_pattern as _restore
+    path = _restore(name)
+    if not path:
+        return JSONResponse(status_code=404, content={"error": "Not found in archive"})
+    from patterns import _parse_frontmatter
+    fm = _parse_frontmatter(path)
+    ptype = fm.get("type", "technique")
+    title = fm.get("title", name)
+    db.upsert_pattern(name=name, ptype=ptype, title=title,
+                      file_path=str(path),
+                      source_sessions=json.dumps(fm.get("source_sessions", []), ensure_ascii=False),
+                      status="verified")
+    return {"restored": True, "name": name, "file_path": str(path)}
+
+@app.get("/api/patterns/{name}/file")
+def read_pattern_file_content(name: str):
+    """直接返回 Pattern Markdown 文件内容，供前端渲染。"""
+    row = db.get_pattern(name)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "Pattern not found"})
+    fm_data = None
+    try:
+        from patterns import read_pattern_file as _rpf
+        fm_data = _rpf(name, row["type"])
+    except Exception:
+        pass
+    return {
+        "name": name,
+        "title": row["title"],
+        "type": row["type"],
+        "status": row["status"],
+        "frontmatter": fm_data.get("frontmatter", {}) if fm_data else {},
+        "body": fm_data.get("body", "") if fm_data else "",
+        "file_path": row["file_path"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Unified Search API — FTS5
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/search")
+def unified_search(q: str = Query(...), limit: int = Query(20)):
+    return db.fts5_search(q, limit=limit)
 
 # 前端静态文件
 static_dir = Path(__file__).parent / "static"

@@ -1,34 +1,13 @@
 ﻿import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from datetime import datetime
 
 from adapters.base import ProviderAdapter, SessionMeta, Message
+from adapters.utils import parse_ts, extract_text_from_content
 
-def _parse_ts(value) -> Optional[float]:
-    """统一将各种时间格式转为秒级时间戳。"""
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        # 判断是毫秒还是秒：大于 1e12 认为是毫秒
-        if value > 1e12:
-            return value / 1000.0
-        return float(value)
-    if isinstance(value, str):
-        # 尝试 ISO 格式
-        try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return dt.timestamp()
-        except Exception:
-            pass
-        # 尝试纯数字字符串
-        try:
-            v = float(value)
-            return _parse_ts(v)
-        except Exception:
-            pass
-    return None
+logger = logging.getLogger(__name__)
 
 class ClaudeCodeAdapter(ProviderAdapter):
     """Claude Code CLI 适配器：解析 .claude/projects/{project}/*.jsonl 格式。"""
@@ -40,6 +19,9 @@ class ClaudeCodeAdapter(ProviderAdapter):
         return False
 
     def _find_files(self) -> List[Path]:
+        return self._cached_find_files(self._scan_files)
+
+    def _scan_files(self) -> List[Path]:
         files = []
         for sp in self.config.get("scan_paths", []):
             base = Path(sp)
@@ -74,33 +56,11 @@ class ClaudeCodeAdapter(ProviderAdapter):
                     if sid:
                         meta[sid] = data
                 except Exception:
-                    pass
+                    logger.debug("Failed to load meta from %s: %s", f.name, exc_info=True)
         return meta
 
     def _make_session_id(self, path: Path) -> str:
         return path.stem
-
-    def _extract_text_from_content(self, content) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            texts = []
-            for c in content:
-                if isinstance(c, dict):
-                    if c.get("type") == "text" and "text" in c:
-                        texts.append(c["text"])
-                    elif c.get("type") == "thinking" and "thinking" in c:
-                        texts.append("[思考] " + c["thinking"])
-                    elif c.get("type") == "tool_use":
-                        name = c.get("name", "")
-                        inp = json.dumps(c.get("input", {}), ensure_ascii=False)
-                        texts.append(f"[工具调用: {name}] {inp}")
-                    elif c.get("type") == "tool_result" and "content" in c:
-                        texts.append(f"[工具结果] {c['content']}")
-                elif isinstance(c, str):
-                    texts.append(c)
-            return "\n".join(texts)
-        return str(content)
 
     def _parse_file(self, path: Path, meta_map: Dict[str, dict]) -> Optional[SessionMeta]:
         session_id = self._make_session_id(path)
@@ -121,12 +81,12 @@ class ClaudeCodeAdapter(ProviderAdapter):
                         continue
                     msg = obj.get("message")
                     if msg and msg.get("role") == "user":
-                        text = self._extract_text_from_content(msg.get("content", ""))
+                        text = extract_text_from_content(msg.get("content", ""))
                         if text.strip():
                             summary = text[:300] + "..." if len(text) > 300 else text
                         break
         except Exception:
-            pass
+            logger.debug("Failed to parse session file %s: %s", path.name, exc_info=True)
 
         parts = path.parts
         for i, part in enumerate(parts):
@@ -139,7 +99,7 @@ class ClaudeCodeAdapter(ProviderAdapter):
 
         stat = path.stat()
         raw_created = meta.get("startedAt", stat.st_ctime * 1000)
-        created_at = _parse_ts(raw_created)
+        created_at = parse_ts(raw_created)
         last_active_at = stat.st_mtime
 
         return SessionMeta(
@@ -185,13 +145,13 @@ class ClaudeCodeAdapter(ProviderAdapter):
                     if not msg:
                         continue
                     role = msg.get("role", "unknown")
-                    content = self._extract_text_from_content(msg.get("content", ""))
-                    ts = _parse_ts(obj.get("timestamp"))
+                    content = extract_text_from_content(msg.get("content", ""))
+                    ts = parse_ts(obj.get("timestamp"))
                     if not content.strip() and role == "assistant":
                         continue
                     messages.append(Message(role=str(role), content=content, ts=ts, raw=msg))
         except Exception:
-            pass
+            logger.debug("Failed to load messages from %s: %s", path.name, exc_info=True)
         return messages
 
     def get_project_dir(self, session_id: str) -> Optional[str]:

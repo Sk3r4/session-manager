@@ -1,14 +1,31 @@
 ﻿import json
-import logging
 import os
 import hashlib
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+from datetime import datetime
 
 from adapters.base import ProviderAdapter, SessionMeta, Message
-from adapters.utils import parse_ts
 
-logger = logging.getLogger(__name__)
+def _parse_ts(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if value > 1e12:
+            return value / 1000.0
+        return float(value)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except Exception:
+            pass
+        try:
+            v = float(value)
+            return _parse_ts(v)
+        except Exception:
+            pass
+    return None
 
 class GenericFileAdapter(ProviderAdapter):
     """通用文件扫描适配器：基于配置扫描目录中的 JSON/JSONL 文件。"""
@@ -20,9 +37,6 @@ class GenericFileAdapter(ProviderAdapter):
         return False
 
     def _find_files(self) -> List[Path]:
-        return self._cached_find_files(self._scan_files)
-
-    def _scan_files(self) -> List[Path]:
         files = []
         patterns = self.config.get("file_patterns", ["*.json", "*.jsonl"])
         for sp in self.config.get("scan_paths", []):
@@ -73,7 +87,6 @@ class GenericFileAdapter(ProviderAdapter):
                     data = json.load(f)
                     lines = data if isinstance(data, list) else [data]
         except Exception:
-            logger.debug("Failed to parse file %s: %s", path.name, exc_info=True)
             return None
 
         if not lines:
@@ -142,7 +155,6 @@ class GenericFileAdapter(ProviderAdapter):
                     data = json.load(f)
                     items = data if isinstance(data, list) else data.get("messages", [data])
         except Exception:
-            logger.debug("Failed to load messages from %s: %s", path.name, exc_info=True)
             return []
 
         for item in items:
@@ -158,7 +170,7 @@ class GenericFileAdapter(ProviderAdapter):
                     elif isinstance(c, str):
                         texts.append(c)
                 content = "\n".join(texts)
-            ts = parse_ts(item.get("timestamp") or item.get("ts") or item.get("created_at"))
+            ts = _parse_ts(item.get("timestamp") or item.get("ts") or item.get("created_at"))
             messages.append(Message(role=str(role), content=str(content), ts=ts, raw=item))
         return messages
 

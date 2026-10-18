@@ -1,27 +1,85 @@
-# Session Manager — AI CLI 会话管理中心
+# Session Manager — AI CLI 会话聚合管理
 
-> 一站式管理 Claude Code、Kimi Code、Codex CLI 等 AI 编程助手的本地会话记录，支持浏览、搜索、恢复、导出。
+> 通过 MCP 让 AI 客户端自动获取本机 AI CLI 会话历史——"我之前在这个目录干过什么"的环境上下文，一键可得。
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-green)
+![MCP](https://img.shields.io/badge/MCP-server-2563EB)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
-## ✨ 功能特性
+## ✨ 这是什么
 
-| 功能 | 说明 |
+v2 起，Session Manager 的核心形态是 **MCP Server**：接入 Claude Code / Codex / ZCode 等 AI 客户端后，AI 可以直接读取、检索、归类你本机的历史会话，用于复盘、续接和跨会话协作。
+
+| 能力 | 说明 |
 |------|------|
-| 🔍 **自动扫描** | 一键扫描本地已安装的 AI CLI 工具（Claude Code / Kimi Code / Codex），自动发现历史会话 |
-| 🏷️ **状态管理** | 为会话打标签：未标注 / 进行中 / 已完成 / 待跟进 / 已归档 |
-| 📌 **置顶会话** | 重要会话可置顶，始终排在列表最前 |
-| 🔎 **全文搜索** | 按标题、摘要、项目目录关键词实时过滤 |
-| 📝 **对话浏览** | 点击卡片查看完整对话记录，支持思考过程、工具调用、工具结果 |
-| 🚀 **一键恢复** | 直接在正确的工作目录打开新终端并恢复会话，无需手动 `cd` |
-| 📋 **复制命令** | 复制 resume 命令到剪贴板，方便在其他终端中使用 |
-| 📤 **导出 Markdown** | 将会话导出为 `.md` 文件，含完整元信息和时间戳 |
-| 📤 **导出 PDF** | 使用微软雅黑字体生成中文友好的 PDF 文档 |
-| 🖥️ **Web 界面** | 基于 Tailwind CSS 的响应式单页应用，笔记本 / 大屏自适应 |
+| 🔍 **环境上下文** | AI 一键获知"当前项目/目录下我之前会话干过什么" |
+| 🧠 **会话检索** | 按 provider、项目、关键词、全文（FTS5）搜索历史会话 |
+| 📜 **转录读取** | 读取任意会话的完整对话内容（含工具调用） |
+| 🏷️ **受控写入** | 合集归类、摘要/标签标注、会话改名（不暴露删除等破坏性操作） |
+| 🔄 **索引刷新** | 按需重新扫描各 CLI 的会话目录，保持索引最新 |
+| 🤖 **一键接入** | `session-manager-install` 自动写入客户端 MCP 配置（写前备份、幂等） |
+
+### 支持的 Provider
+
+| Provider | 数据源 |
+|----------|--------|
+| Claude Code | `~/.claude/projects/**/*.jsonl` |
+| Codex CLI | `~/.codex/sessions/` + `~/.codex/archived_sessions/` |
+| ZCode | `~/.zcode/cli/db.sqlite`（只读） |
+| 通用 | 任意 JSON/JSONL 目录（`generic` 适配器） |
+
+---
+
+## 🚀 快速开始
+
+### 方式一：pip 安装（推荐）
+
+```bash
+pip install session_manager-2.1.0-py3-none-any.whl
+
+# 把 MCP 注册进本机已安装的 AI 客户端（ZCode / Claude Code / Codex）
+session-manager-install
+```
+
+### 方式二：仓库运行
+
+```bash
+git clone https://github.com/Sk3r4/session-manager.git
+cd session-manager
+pip install -r requirements.txt
+```
+
+### 接入 MCP 客户端
+
+在任意支持 MCP 的 AI 客户端配置中加入：
+
+```json
+{
+  "mcpServers": {
+    "sessions": {
+      "command": "session-manager-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+或直接以脚本方式运行：
+
+```json
+{
+  "mcpServers": {
+    "sessions": {
+      "command": "python",
+      "args": ["D:\\path\\to\\session-manager\\mcp_server.py"]
+    }
+  }
+}
+```
+
+`session-manager-install` 会自动完成上述写入：只修改**已存在**的客户端配置（不为未安装的客户端创建配置），写前生成 `.bak` 备份，重复执行幂等。
 
 ---
 
@@ -29,147 +87,59 @@
 
 ```
 session-manager/
-├── adapters/              # Provider 适配器（可扩展）
-│   ├── base.py            # 适配器基类
-│   ├── claude_code.py     # Claude Code 适配器
-│   ├── codex.py           # Codex CLI 适配器
-│   ├── kimi_code.py       # Kimi Code 适配器（含 work_dirs 映射解析）
-│   └── generic.py         # 通用文件扫描适配器
-├── storage/
-│   └── index.py           # SQLite 数据库操作
-├── static/
-│   └── index.html         # Web 前端（单页应用）
-├── config.py              # Provider 配置与默认设置
-├── exporter.py            # Markdown / PDF 导出
-├── main.py                # FastAPI 入口
-├── start.ps1              # Windows PowerShell 启动脚本
-├── start.bat              # Windows CMD 启动脚本
-├── requirements.txt       # Python 依赖
-└── data/                  # 运行时数据（SQLite 数据库，自动创建）
+├── mcp_server.py         # MCP Server（stdio，核心入口）
+├── setup_cli.py          # session-manager-install：一键注册 MCP 到客户端
+├── config.py             # Provider 默认配置 + 数据目录解析
+├── transcript_util.py    # 转录合并、智能摘要
+├── errors.py
+├── adapters/             # Provider 适配器（可扩展）
+│   ├── base.py           # 适配器基类
+│   ├── claude_code.py
+│   ├── codex.py
+│   ├── zcode.py
+│   └── generic.py        # 通用 JSONL 扫描兜底
+├── storage/              # SQLite 持久层（WAL）
+│   ├── schema.py         # 版本化迁移（PRAGMA user_version 驱动，幂等）
+│   ├── index.py          # IndexDB 门面
+│   ├── sessions.py       # 会话 CRUD
+│   ├── projects.py       # 项目聚合
+│   ├── collections.py    # 合集归类
+│   ├── tags.py           # 标签
+│   ├── fts.py            # FTS5 全文索引
+│   └── base.py
+├── services/
+│   ├── scan.py           # 扫描编排（调用 adapters 入库）
+│   └── annotate.py       # AI 标注（摘要/标签）
+└── data/                 # 运行时数据（index.db，自动创建，不入库）
 ```
 
 ---
 
-## 🚀 快速开始
+## 💾 数据目录
 
-### 1. 克隆项目
+| 模式 | 位置 |
+|------|------|
+| 仓库检出（含 `.git`/`static`） | `<repo>/data/` |
+| 包安装（pip/uvx） | `~/.session-manager/` |
+| 强制覆盖 | 环境变量 `SM_DATA_DIR` |
 
-```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/session-manager.git
-cd session-manager
-```
-
-### 2. 创建虚拟环境（推荐）
-
-```bash
-# Windows (PowerShell)
-python -m venv .venv
-.venv\Scripts\activate
-
-# macOS / Linux
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. 启动服务
-
-```bash
-# 方式一：直接启动
-python -m uvicorn main:app --host 127.0.0.1 --port 7821
-
-# 方式二：使用启动脚本（Windows）
-.\start.ps1        # PowerShell
-.\start.bat        # CMD
-```
-
-### 5. 打开浏览器
-
-访问 [http://127.0.0.1:7821](http://127.0.0.1:7821)
+Web、MCP、后台标注线程共享同一个 `index.db`，WAL 模式保证多写者并发安全。
 
 ---
 
-## 📋 使用指南
+## 🔧 扩展 Provider
 
-### 首次使用
-
-1. 打开页面后，点击 **"扫描全部"** 按钮，系统会自动检测已安装的 AI CLI 并导入历史会话
-2. 如果没有自动检测到，检查 `config.py` 中的 `scan_paths` 是否匹配你的安装路径
-
-### 日常操作
-
-- **查看对话**：点击会话卡片，右侧滑出详情面板
-- **修改状态**：在卡片右上角下拉选择新状态
-- **置顶/取消置顶**：点击 📌 图标
-- **恢复会话**：点击 "启动终端恢复"，会自动 `cd` 到正确目录并执行 resume 命令
-- **导出记录**：在详情面板中点击 "导出 Markdown" 或 "导出 PDF"
-
-### 支持的 Provider
-
-| Provider | 数据路径（默认） | resume 命令 |
-|----------|-----------------|------------|
-| Claude Code | `~/.claude/projects/` | `claude -r "{session_id}"` |
-| Kimi Code | `~/.kimi/sessions/` | `kimi -r "{session_id}"` |
-| Codex CLI | `~/.codex/sessions/` | `codex resume "{session_id}"` |
-
-> Kimi Code 的 resume 命令**必须在正确的项目目录下执行**，否则会导致恢复后丢失上下文。Session Manager 已自动处理此问题。
+1. 在 `adapters/` 下新建适配器类，继承 `ProviderAdapter`
+2. 实现 `detect()` / `scan_sessions()` / `load_transcript()`
+3. 在 `adapters/__init__.py` 的 `build_adapter()` 注册
+4. 在 `config.py` 的 `DEFAULT_PROVIDER_CONFIGS` 添加默认配置
 
 ---
 
-## ⚙️ 配置说明
+## 📦 版本
 
-首次启动后，会在 `data/providers.json` 中持久化配置。你可以手动编辑以：
-
-- 启用/禁用某个 Provider
-- 修改扫描路径（如果安装位置非默认）
-- 添加自定义 Provider（需编写适配器）
-
-```json
-{
-  "id": "my-provider",
-  "name": "My Custom CLI",
-  "enabled": true,
-  "adapter_type": "generic",
-  "scan_paths": ["C:/custom/path/sessions"],
-  "file_patterns": ["*.jsonl"],
-  "resume_command_template": "mycli resume \"{session_id}\""
-}
-```
-
----
-
-## 🔧 扩展适配器
-
-要支持新的 AI CLI 工具，只需：
-
-1. 在 `adapters/` 下创建新的适配器类，继承 `ProviderAdapter`
-2. 实现 `detect()`、`scan_sessions()`、`load_transcript()` 方法
-3. 在 `adapters/__init__.py` 的 `build_adapter()` 中注册
-4. 在 `config.py` 的 `DEFAULT_PROVIDER_CONFIGS` 中添加默认配置
-
-参考 `adapters/kimi_code.py` 了解完整的实现范例。
-
----
-
-## 🖥️ 开发环境
-
-- **操作系统**: Windows 10/11（主要测试平台），理论兼容 macOS/Linux
-- **Python**: 3.11+
-- **前端**: 原生 HTML + Tailwind CSS CDN（零构建）
-- **数据库**: SQLite（零配置）
-
-### Windows 特殊说明
-
-- PowerShell 默认使用 GBK 编码，Kimi CLI 的 Rich TUI 输出中文可能崩溃
-- Session Manager 在启动终端时已自动注入 `chcp 65001` + UTF-8 编码设置
-- 前端更新后请按 **Ctrl + F5** 强制刷新，避免浏览器缓存旧版本
-
----
+- 当前：**v2.1.0**（瘦身后基线 schema v1）
+- v1 时代（FastAPI Web 应用形态）的代码保留在 git 历史中，tag 之前可查
 
 ## 📄 许可证
 
